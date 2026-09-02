@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+~$*.xlsx
+*（周计划明细）.xlsx
+三四五级风险汇总*.txt
+周计划项目汇总.txt
+周计划导出错误日志.txt
+.DS_Store
