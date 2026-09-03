@@ -61,6 +61,7 @@ PAGE_HEIGHT_SAFETY_FACTOR = 0.96
 # 其他单元格不加，也不再全表统一减 1。
 # ============================================================
 MEASURES_HEIGHT_PLUS = 1.0
+MEASURES_SRC_HEIGHT_PLUS = 0.0  # 源表管控措施列插行/行高余量（磅），0=不加，插行接管
 
 # -------------------- 工具函数 --------------------
 def safe_print(msg, error=False):
@@ -1201,15 +1202,8 @@ def insert_overflow_rows_by_measures(ws, start_row=3):
             continue
         cell_val = ws.cell(row, measures_col).value
         text = str(cell_val or "").strip()
-        # 估算该单元格文本所需总高度（简易字符算法，无需逐字精确win32）
-        needed_height = 15.0
-        if text:
-            lines = text.split('\n')
-            total_lines = 0
-            for line in lines:
-                line_width = sum(2.2 if '\u4e00' <= ch <= '\u9fff' else 1.0 for ch in line)
-                total_lines += max(1, math.ceil(line_width / est_width))
-            needed_height = max(15.0, total_lines * 18.0 * 1.15)
+        # 估算该单元格文本所需总高度（借鉴日计划 AutoFitRowEx 算法：中文2.3宽/英文1.1宽、每行=字号*1.5+3磅、×1.15安全系数）
+        needed_height = _estimate_text_height(text, est_width)
         # 超出 Excel 单行上限 409.5 磅，触发整行插行
         if needed_height > EXCEL_MAX_ROW_HEIGHT:
             rows_needed = math.ceil(needed_height / EXCEL_MAX_ROW_HEIGHT)
@@ -1287,7 +1281,11 @@ def insert_overflow_rows_by_measures(ws, start_row=3):
             total_inserted += rows_to_insert
             row = end_insert_row + 1
         else:
-            # 不插行：保持原行高（不覆盖），避免压缩上报表精心设置的行高
+            # 不插行：行高取估算与原行高较大值（+可配余量），超上限则保持（原表行高已充分时不改动）
+            cur_height = ws.row_dimensions[row].height or 15.0
+            target = max(needed_height, cur_height) + MEASURES_SRC_HEIGHT_PLUS
+            if target <= EXCEL_MAX_ROW_HEIGHT:
+                ws.row_dimensions[row].height = round(target, 1)
             row += 1
     return total_inserted
 
