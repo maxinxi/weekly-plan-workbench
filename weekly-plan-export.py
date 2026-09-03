@@ -706,25 +706,23 @@ def fix_missing_time_dash(ws, max_row):
     return changed
 def preprocess_source_file(src):
     """
-    源表预处理（始终执行，导出清洗副本，不覆盖原始源文件）：
-    1. 创建"源文件备份"文件夹，复制原始源文件
+    源表预处理（始终执行，就地插行并保存，维持原文件名）：
+    1. 创建"源文件备份"文件夹，复制原始源文件（原始上报文件始终有备份）
     2. 检测并删除示例行/填报人行（仅按文本含"例"/"示例"剔除，不再因黄色填充删行）
     3. 单元格内换行统一：统一换行符、清理多余空行
     4. 姓名+电话合并（无空格紧贴拼接，仅处理人员/联系相关列）
     5. 时间列补齐遗漏的"-"分隔符（严格限定时间列，未识别则跳过）
-    6. 保存清洗副本到 _已清洗.xlsx（不覆盖原始文件）
-    7. 对清洗副本执行【管控措施】列超长插行，导出（第X周）（处理后的源表）.xlsx
-    返回：清洗副本路径
+    6. 对源表【管控措施】列超长整行插行 + 均分行高（未超长保持原行高）
+    7. 保存回原始源文件（文件名不变）
+    返回：原始源文件路径（已就地插行处理）
     """
     import shutil
     global _processed_source_cache
 
     # 单次预处理判定：同一文件只清洗一次，避免 1,2,3 批量任务重复触发
     if src in _processed_source_cache:
-        cached = src.replace('.xlsx', '_已清洗.xlsx')
-        if os.path.exists(cached):
-            safe_print(f"  🔁 源表 {os.path.basename(src)} 已预处理过，直接复用清洗副本")
-            return cached
+        safe_print(f"  🔁 源表 {os.path.basename(src)} 已预处理过，直接复用，跳过")
+        return src
 
     safe_print(f"  🔍 源表预处理开始...")
 
@@ -806,28 +804,40 @@ def preprocess_source_file(src):
     # 5. 时间列补齐"-"
     fix_missing_time_dash(ws, ws.max_row)
 
-    # 6. 保存清洗副本（不覆盖原始源文件）
-    cleaned_path = src.replace('.xlsx', '_已清洗.xlsx')
+    # 6. 对源表【管控措施】列超长整行插行（就地，未超长保持原行高）
     try:
-        wb.save(cleaned_path)
-        wb.close()
-        safe_print(f"  ✅ 预处理完成：已导出清洗副本 {os.path.basename(cleaned_path)}（原始文件未改动）")
+        insert_overflow_rows_by_measures(ws, start_row=3)
     except Exception as e:
-        safe_print(f"  ❌ 保存清洗副本失败: {e}")
+        safe_print(f"  ⚠️  管控措施列插行处理失败: {e}")
+
+    # 7. 保存回原始源文件（文件名不变，维持原名）
+    try:
+        if not os.access(src, os.W_OK):
+            safe_print(f"  ⚠️  检测到文件为只读，正在解除只读属性...")
+            try:
+                import stat
+                os.chmod(src, stat.S_IWRITE | stat.S_IREAD)
+            except Exception:
+                pass
+            try:
+                import subprocess
+                subprocess.run(['attrib', '-r', src], shell=True, capture_output=True)
+            except Exception:
+                pass
+        wb.save(src)
+        wb.close()
+        safe_print(f"  ✅ 预处理完成：源表已就地插行并保存（文件名不变）{os.path.basename(src)}")
+    except Exception as e:
+        safe_print(f"  ❌ 保存源文件失败: {e}")
+        safe_print(f"  💡 可能原因：文件正在被Excel打开 / 文件为只读 / 权限不足")
         try:
             wb.close()
         except Exception:
             pass
         return src
 
-    # 7. 对清洗副本执行【管控措施】列超长插行，导出处理后源表
-    try:
-        export_processed_source(cleaned_path, src)
-    except Exception as e:
-        safe_print(f"  ⚠️  处理后源表生成失败: {e}")
-
     _processed_source_cache.add(src)
-    return cleaned_path
+    return src
 def cleanup_preprocessed_file(path):
     """预处理已改为就地修改源文件，不再产生临时文件，此函数保留为空操作。"""
     pass
@@ -1159,7 +1169,7 @@ def insert_overflow_rows_by_measures(ws, start_row=3):
     # 1. 动态定位【管控措施】列（仅扫描第2-3行表头，排除第1行大标题）
     #    优先精确匹配"管控措施"，未命中再放宽到"措施/关键风险"，避免误锁"关键风险点"列
     measures_col = None
-    for kw in (("管控措施",), ("措施", "关键风险")):
+    for kw in (("管控措施", "防范措施"), ("措施", "关键风险")):
         for c in range(1, max_col + 1):
             for r in (2, 3):
                 val = str(ws.cell(r, c).value or "").strip()
@@ -1181,6 +1191,14 @@ def insert_overflow_rows_by_measures(ws, start_row=3):
     total_inserted = 0
     row = start_row
     while row <= ws.max_row:
+        # 若当前行是管控措施列合并区的非首行（从属行），跳过避免重复插行
+        is_sub_merged = any(
+            rng.min_row < row <= rng.max_row and rng.min_col <= measures_col <= rng.max_col
+            for rng in ws.merged_cells.ranges
+        )
+        if is_sub_merged:
+            row += 1
+            continue
         cell_val = ws.cell(row, measures_col).value
         text = str(cell_val or "").strip()
         # 估算该单元格文本所需总高度（简易字符算法，无需逐字精确win32）
@@ -1258,7 +1276,13 @@ def insert_overflow_rows_by_measures(ws, start_row=3):
             # 7. 均匀分配行高到每一个物理行（每行都不超过 409.5）
             avg_height = round(needed_height / rows_needed, 1)
             for r_sub in range(row, end_insert_row + 1):
-                ws.row_dimensions[r_sub].height = avg_height
+                ws.row_dimensions[r_sub].height = avg_height  # 设 height 后 customHeight 自动为 True
+
+            # 8. 管控措施列插行区域强制居左对齐 + 垂直居中 + 自动换行（长文本更易读）
+            for r_sub in range(row, end_insert_row + 1):
+                cell = ws.cell(r_sub, measures_col)
+                cell.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+
             print(f"  📏 第{row}行【管控措施】超长({needed_height:.0f}磅)，已插入{rows_to_insert}行续行，所有列全量合并，每行分摊{avg_height}磅")
             total_inserted += rows_to_insert
             row = end_insert_row + 1
