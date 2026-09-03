@@ -16,6 +16,7 @@ import os
 import re
 import glob
 import sys
+import math
 import traceback
 from datetime import datetime, timedelta
 from collections import OrderedDict
@@ -516,46 +517,23 @@ def _has_strikethrough(cell):
     return False
 
 def normalize_majority_format(ws, max_row, max_col):
-    """
-    按列严格多数派统一数据区格式：水平对齐、垂直对齐、字体名称、字体大小。
-    借鉴参考文件 normalize_data_region_majority_format。
-    只处理这4项，不改变字体颜色、加粗、填充、边框、数字格式等。
-    数据从第3行开始（第1行标题，第2行表头）。
-    返回修改的单元格总数。
-    """
+    """多数派格式统一：修正起始行为第3行，禁止修改表头和标题。"""
     from collections import Counter
-    DATA_START_ROW = 1
+    DATA_START_ROW = 3  # 跳过标题和表头
     changed_total = 0
-    changed_cols = []
 
     for col in range(1, max_col + 1):
-        # 收集该列所有非空、且是合并区域锚点的单元格
         cells = []
         for row in range(DATA_START_ROW, max_row + 1):
             cell = ws.cell(row, col)
             if cell.value is None or str(cell.value).strip() == "":
-                continue
-            # 检查是否是合并区域的左上角锚点
-            is_anchor = True
-            for rng in ws.merged_cells.ranges:
-                if rng.min_row <= row <= rng.max_row and rng.min_col <= col <= rng.max_col:
-                    is_anchor = (row == rng.min_row and col == rng.min_col)
-                    break
-            if not is_anchor:
                 continue
             cells.append((row, cell))
 
         if len(cells) < 2:
             continue
 
-        col_changed = []
-        for prop_name, prop_label in [
-            ("horizontal", "水平对齐"),
-            ("vertical", "垂直对齐"),
-            ("font_name", "字体"),
-            ("font_size", "字号"),
-        ]:
-            # 收集观测值
+        for prop_name in ("horizontal", "vertical", "font_name", "font_size"):
             observed = []
             for row, cell in cells:
                 if prop_name == "horizontal":
@@ -572,24 +550,19 @@ def normalize_majority_format(ws, max_row, max_col):
             if len(observed) < 2:
                 continue
 
-            counts = Counter(val for _, _, val in observed)
-            dominant_val, dominant_cnt = counts.most_common(1)[0]
-            # 只要有占比最高的就统一（不要求>50%），确保字体/字号/对齐始终统一
-            # 如果所有值占比相同（如各50%），取Counter返回的第一个
-            changed = 0
+            dominant_val, dominant_cnt = Counter(v for _, _, v in observed).most_common(1)[0]
+            if dominant_cnt * 2 <= len(observed):
+                continue
+
             for row, cell, cur_val in observed:
                 if cur_val == dominant_val:
                     continue
-                # 设置新值（openpyxl 样式对象不可变，需创建新对象）
                 if prop_name in ("horizontal", "vertical"):
                     old = cell.alignment
                     cell.alignment = Alignment(
                         horizontal=dominant_val if prop_name == "horizontal" else old.horizontal,
                         vertical=dominant_val if prop_name == "vertical" else old.vertical,
                         wrap_text=old.wrap_text,
-                        shrink_to_fit=old.shrink_to_fit,
-                        indent=old.indent,
-                        text_rotation=old.text_rotation,
                     )
                 elif prop_name in ("font_name", "font_size"):
                     old = cell.font
@@ -599,26 +572,10 @@ def normalize_majority_format(ws, max_row, max_col):
                         bold=old.bold,
                         italic=old.italic,
                         color=old.color,
-                        underline=old.underline,
-                        strikethrough=old.strikethrough,
                     )
-                changed += 1
-
-            if changed > 0:
-                col_changed.append(f"{prop_label} {changed}处")
-                changed_total += changed
-
-        if col_changed:
-            col_letter = get_column_letter(col)
-            changed_cols.append(f"{col_letter}列（{'、'.join(col_changed)}）")
-
-    if changed_cols:
-        safe_print(f"  📐 多数派格式统一：按列修正 {changed_total} 个单元格；{'；'.join(changed_cols)}")
-    else:
-        safe_print(f"  📐 多数派格式统一：各列格式已一致，或不存在严格多数派，无需修正")
+                changed_total += 1
 
     return changed_total
-
 def normalize_cell_line_breaks(ws, max_row, max_col):
     """统一单元格内换行格式：
     1. 统一换行符为 \\n（\\r\\n、\\r 转为 \\n）
@@ -666,142 +623,108 @@ def normalize_cell_line_breaks(ws, max_row, max_col):
     return changed
 
 def merge_name_phone(ws, max_row, max_col):
-    """合并单元格内换行分隔的姓名+电话号码为一行（不换行）。
-    检测逻辑：如果单元格内容包含换行，且其中某一行匹配电话号码格式
-    （11位手机号 / 带区号座机），则去掉换行，合并为"姓名 电话号码"一行。
-    数据从第3行开始。返回修改的单元格数。
+    """
+    合并单元格内换行的姓名与电话（无空格紧贴拼接）。
+    1. 修正起始行为第3行，严禁触碰第1行大标题与第2行业务表头。
+    2. 优先动态识别表头含"人"、"负责人"、"联系"等关键词的列，避免全表误伤。
     """
     changed = 0
-    DATA_START_ROW = 1
-    # 电话号码：11位手机号(1开头) / 带区号座机(0开头，3-4位区号-7-8位号码)
+    DATA_START_ROW = 3  # 严格从数据行开始，保护标题与表头
     phone_pattern = re.compile(r'^(1\d{10}|0\d{2,3}-?\d{7,8})$')
 
-    for row in range(DATA_START_ROW, max_row + 1):
-        for col in range(1, max_col + 1):
+    # 动态定位人员/联系方式相关列
+    target_cols = []
+    for c in range(1, max_col + 1):
+        header_val = str(ws.cell(2, c).value or "").strip()
+        if any(kw in header_val for kw in ("人", "联系", "电话", "到岗", "监护")):
+            target_cols.append(c)
+
+    # 若表头未识别到，降级扫描前20列，但避开前3列（序号、工程、专业）
+    if not target_cols:
+        target_cols = list(range(4, max_col + 1))
+
+    for col in target_cols:
+        for row in range(DATA_START_ROW, max_row + 1):
             cell = ws.cell(row, col)
-            if cell.value is None or not isinstance(cell.value, str):
+            if not cell.value or not isinstance(cell.value, str):
                 continue
             original = cell.value
             if '\n' not in original and '\r' not in original:
                 continue
-            # 统一换行符并按行拆分
+
             text = original.replace('\r\n', '\n').replace('\r', '\n')
             lines = [line.strip() for line in text.split('\n') if line.strip()]
             if len(lines) < 2:
                 continue
-            # 检查是否有行匹配电话号码
-            has_phone = any(phone_pattern.match(line) for line in lines)
-            if not has_phone:
-                continue
-            # 合并为一行，用空格连接
-            new_text = ''.join(lines)
-            if new_text != original:
-                cell.value = new_text
-                changed += 1
-    if changed > 0:
-        safe_print(f"  📞 姓名电话合并：修正了 {changed} 个单元格（换行的姓名+电话合并为一行）")
+
+            # 校验是否存在匹配电话号码的行
+            if any(phone_pattern.match(line) for line in lines):
+                # 按照业务规则：姓名与电话紧贴拼接，不加空格
+                new_text = ''.join(lines)
+                if new_text != original:
+                    cell.value = new_text
+                    changed += 1
+
+    safe_print(f"  📞 姓名电话合并：修正了 {changed} 个单元格（无空格紧贴合并）")
     return changed
-
 def fix_missing_time_dash(ws, max_row):
-    """补齐时间列中遗漏的"-"分隔符（自动识别时间列）。
-    1. 先在前10行搜索包含"时间"关键词的表头，自动定位时间列
-    2. 找不到表头时，扫描前20列中所有包含时间格式的单元格
-    检测逻辑：单元格包含两个及以上时间点（H:MM 格式），
-    且整个内容中没有 - / – / 至 / 到 / ~ 等连接词，
-    则在第一个时间点后面补上 " - "。
-    支持任意日期格式（YYYY/M/D、YYYY年M月D日、M/D 等）。
-    数据从第3行开始。返回修改的单元格数。
-    """
-    changed = 0
-    DATA_START_ROW = 1
-    separators = ['-', '–', '—', '至', '到', '~', '～']
+    """时间列破折号补齐：严格限定在识别出的时间列执行，未识别则退出。"""
+    DATA_START_ROW = 3
     max_col = min(ws.max_column, 20)
-
-    # 1. 自动识别时间列：在第2-5行搜索包含"时间"的表头（排除第1行大标题）
     time_col = None
-    for r in range(2, min(6, ws.max_row + 1)):
+
+    for r in (2, 1):
         for c in range(1, max_col + 1):
-            val = ws.cell(r, c).value
-            # 只考虑短文本（<=20字符），排除长标题误判
-            if val and isinstance(val, str) and len(val) <= 20 and "时间" in val:
+            val = str(ws.cell(r, c).value or "")
+            if len(val) <= 20 and "时间" in val:
                 time_col = c
                 break
         if time_col:
             break
 
-    # 2. 确定要处理的列：找到时间列就只处理该列，否则扫描所有列
-    if time_col:
-        cols_to_check = [time_col]
-        safe_print(f"  ⏰ 时间补齐：自动识别到时间列在第{time_col}列（表头含'时间'）")
-    else:
-        cols_to_check = list(range(1, max_col + 1))
-        safe_print(f"  ⏰ 时间补齐：未识别到时间列表头，扫描前{max_col}列")
+    if not time_col:
+        safe_print("  ⏰ 时间补齐：未明确识别到时间列表头，放弃自动补齐以防篡改工作内容")
+        return 0
 
-    # 3. 处理每一列
-    for col in cols_to_check:
-        for row in range(DATA_START_ROW, max_row + 1):
-            cell = ws.cell(row, col)
-            if cell.value is None or not isinstance(cell.value, str):
-                continue
-            original = cell.value.strip()
-            if not original:
-                continue
-            # 提取所有时间点 H:MM
-            time_matches = list(re.finditer(r'\d{1,2}:\d{2}', original))
-            if len(time_matches) < 2:
-                continue
-            # 所有时间单元格设置水平居中对齐（保持垂直居中和自动换行）
-            old_align = cell.alignment
-            cell.alignment = Alignment(
-                horizontal='center',
-                vertical=old_align.vertical or 'center',
-                wrap_text=True,
-                shrink_to_fit=old_align.shrink_to_fit,
-                indent=old_align.indent,
-                text_rotation=old_align.text_rotation,
-            )
-            # 检查前两个时间点之间是否有连接词
-            # 注意：日期中的-（如2026-08-28，前后都是数字）不算连接词
-            first_end = time_matches[0].end()
-            second_start = time_matches[1].start()
-            between = original[first_end:second_start]
-            # 连接词：- 前后至少有一个非数字（不是日期中的-）；或 –/—/至/到/~
-            has_dash = bool(re.search(r'(?<!\d)-|-(?!\d)', between))
-            has_separator = (
-                has_dash or '–' in between or '—' in between or
-                '至' in between or '到' in between or '~' in between or '～' in between
-            )
-            if has_separator:
-                continue
-            # 在第一个时间点后面插入 "-"（前面不加空格，保持原表格式）
+    changed = 0
+    for row in range(DATA_START_ROW, max_row + 1):
+        cell = ws.cell(row, time_col)
+        original = str(cell.value or "").strip()
+        time_matches = list(re.finditer(r'\d{1,2}:\d{2}', original))
+        if len(time_matches) < 2:
+            continue
+
+        first_end = time_matches[0].end()
+        second_start = time_matches[1].start()
+        between = original[first_end:second_start]
+        has_separator = any(sep in between for sep in ('-', '–', '—', '至', '到', '~', '～'))
+        if not has_separator:
             rest = original[first_end:]
-            # 如果原来以换行开头，补齐"-"后保留换行（开始时间-在第一行，结束时间在第二行）
-            if rest.startswith('\n') or rest.startswith('\r\n'):
-                new_text = original[:first_end] + '-\n' + rest.lstrip()
-            else:
-                new_text = original[:first_end] + '- ' + rest.lstrip()
-            if new_text != original:
-                cell.value = new_text
-                changed += 1
-    if changed > 0:
-        safe_print(f"  ⏰ 时间补齐：修正了 {changed} 个时间单元格遗漏的\"-\"分隔符，并设置居中对齐")
-    else:
-        safe_print(f"  ⏰ 时间补齐：所有时间单元格已设置居中对齐")
-    return changed
+            cell.value = original[:first_end] + '-' + rest.lstrip()
+            changed += 1
 
+    return changed
 def preprocess_source_file(src):
     """
-    源表预处理（始终执行，先备份再就地修改源文件）：
+    源表预处理（始终执行，导出清洗副本，不覆盖原始源文件）：
     1. 创建"源文件备份"文件夹，复制原始源文件
-    2. 检测并删除示例行/填报人行
-    3. 拆分合并单元格（确保格式统一覆盖所有单元格）
-    4. 多数派格式统一：按列统一字体、字号、对齐方式
-    5. 单元格内换行统一：统一换行符、清理多余空行
-    6. 时间列补齐遗漏的"-"分隔符
-    7. 保存回原始源文件（就地修改）
-    返回：原始源文件路径（已就地修改）
+    2. 检测并删除示例行/填报人行（仅按文本含"例"/"示例"剔除，不再因黄色填充删行）
+    3. 单元格内换行统一：统一换行符、清理多余空行
+    4. 姓名+电话合并（无空格紧贴拼接，仅处理人员/联系相关列）
+    5. 时间列补齐遗漏的"-"分隔符（严格限定时间列，未识别则跳过）
+    6. 保存清洗副本到 _已清洗.xlsx（不覆盖原始文件）
+    7. 对清洗副本执行【管控措施】列超长插行，导出（第X周）（处理后的源表）.xlsx
+    返回：清洗副本路径
     """
     import shutil
+    global _processed_source_cache
+
+    # 单次预处理判定：同一文件只清洗一次，避免 1,2,3 批量任务重复触发
+    if src in _processed_source_cache:
+        cached = src.replace('.xlsx', '_已清洗.xlsx')
+        if os.path.exists(cached):
+            safe_print(f"  🔁 源表 {os.path.basename(src)} 已预处理过，直接复用清洗副本")
+            return cached
 
     safe_print(f"  🔍 源表预处理开始...")
 
@@ -828,6 +751,7 @@ def preprocess_source_file(src):
     example_reason = ""
 
     # 2. 检测示例行/填报人行（前20行）
+    #    仅依据文本是否明确包含"例"字或"示例"来剔除模板示例行，不因黄色填充删行
     scan_range = min(20, ws.max_row)
     for r in range(1, scan_range + 1):
         a_val = ws.cell(r, 1).value
@@ -836,12 +760,9 @@ def preprocess_source_file(src):
         is_example = False
         reasons = []
         # A列含"例"字且长度<=5（序号列是短文本，排除长标题误判）
-        if a_val and isinstance(a_val, str) and len(a_val) <= 5 and "例" in a_val:
+        if a_val and isinstance(a_val, str) and len(a_val) <= 5 and ("例" in a_val or "示例" in a_val):
             is_example = True
             reasons.append(f"含'例'字('{a_val}')")
-        if _is_yellow_fill(ws.cell(r, 1)):
-            is_example = True
-            reasons.append("标黄")
         if _has_strikethrough(ws.cell(r, 1)):
             is_example = True
             reasons.append("有删除线")
@@ -857,7 +778,7 @@ def preprocess_source_file(src):
                 filler_row = r
                 safe_print(f"    📌 检测到填报人行：第{r}行（B列='{b_clean}'）")
 
-    # 先删除示例行/填报人行（避免影响多数派格式统计）
+    # 先删除示例行/填报人行（避免影响后续统计）
     if example_row is not None or filler_row is not None:
         rows_to_delete = sorted(set(r for r in [example_row, filler_row] if r is not None), reverse=True)
         for r in rows_to_delete:
@@ -874,46 +795,39 @@ def preprocess_source_file(src):
     else:
         safe_print(f"  ✅ 未检测到示例行和填报人行，跳过删除（扫描了前{scan_range}行）")
 
-    # 注意：不拆分合并单元格，不统一字体大小，保持源表原有结构和字体
     format_max_col = min(ws.max_column, 20)
 
-    # 4. 单元格内换行统一（统一换行符、清理多余空行）
+    # 3. 单元格内换行统一
     normalize_cell_line_breaks(ws, ws.max_row, format_max_col)
 
-    # 5. 姓名+电话合并（换行的姓名+电话号码合并为一行）
+    # 4. 姓名+电话合并
     merge_name_phone(ws, ws.max_row, format_max_col)
 
-    # 6. 时间列补齐遗漏的"-"
+    # 5. 时间列补齐"-"
     fix_missing_time_dash(ws, ws.max_row)
 
-    # 7. 保存回原始源文件（就地修改）
-    # 保存前检测并解除只读属性（Windows下只读文件会导致保存静默失败）
+    # 6. 保存清洗副本（不覆盖原始源文件）
+    cleaned_path = src.replace('.xlsx', '_已清洗.xlsx')
     try:
-        if not os.access(src, os.W_OK):
-            safe_print(f"  ⚠️  检测到文件为只读，正在解除只读属性...")
-            try:
-                import stat
-                os.chmod(src, stat.S_IWRITE | stat.S_IREAD)
-            except Exception:
-                pass
-            try:
-                import subprocess
-                subprocess.run(['attrib', '-r', src], shell=True, capture_output=True)
-            except Exception:
-                pass
-        wb.save(src)
+        wb.save(cleaned_path)
         wb.close()
-        safe_print(f"  ✅ 预处理完成：已就地修改源文件 {os.path.basename(src)}")
+        safe_print(f"  ✅ 预处理完成：已导出清洗副本 {os.path.basename(cleaned_path)}（原始文件未改动）")
     except Exception as e:
-        safe_print(f"  ❌ 保存源文件失败: {e}")
-        safe_print(f"  💡 可能原因：文件正在被Excel打开 / 文件为只读 / 权限不足")
-        safe_print(f"  💡 请关闭Excel后重试，或右键文件→属性→去掉'只读'勾选")
+        safe_print(f"  ❌ 保存清洗副本失败: {e}")
         try:
             wb.close()
         except Exception:
             pass
-    return src
+        return src
 
+    # 7. 对清洗副本执行【管控措施】列超长插行，导出处理后源表
+    try:
+        export_processed_source(cleaned_path, src)
+    except Exception as e:
+        safe_print(f"  ⚠️  处理后源表生成失败: {e}")
+
+    _processed_source_cache.add(src)
+    return cleaned_path
 def cleanup_preprocessed_file(path):
     """预处理已改为就地修改源文件，不再产生临时文件，此函数保留为空操作。"""
     pass
@@ -1228,6 +1142,162 @@ def _apply_height_to_rows(ws, start_row, end_row, required_height):
             leftover = 0.0
         if actual_add > 0:
             ws.row_dimensions[r].height = current + actual_add
+# ============================================================
+# ★ 源表【管控措施】列超长整行插行（处理后源表）
+# ============================================================
+_processed_source_cache = set()  # 单次预处理判定：同一源文件只清洗一次
+
+
+def insert_overflow_rows_by_measures(ws, start_row=3):
+    """
+    只针对【管控措施】列超长进行全列贯穿式插行分摊
+    ws: 源表 Worksheet
+    start_row: 数据起始行（跳过标题和表头，通常为第3行）
+    """
+    max_col = ws.max_column
+
+    # 1. 动态定位【管控措施】列（仅扫描第2-3行表头，排除第1行大标题）
+    #    优先精确匹配"管控措施"，未命中再放宽到"措施/关键风险"，避免误锁"关键风险点"列
+    measures_col = None
+    for kw in (("管控措施",), ("措施", "关键风险")):
+        for c in range(1, max_col + 1):
+            for r in (2, 3):
+                val = str(ws.cell(r, c).value or "").strip()
+                if val and len(val) <= 20 and any(k in val for k in kw):
+                    measures_col = c
+                    break
+            if measures_col:
+                break
+        if measures_col:
+            break
+
+    if not measures_col:
+        print("  ⚠️ 未找到【管控措施】列，跳过插行处理")
+        return 0
+    print(f"  📌 锁定【管控措施】列：第 {measures_col} 列 ({get_column_letter(measures_col)}列)")
+    col_width = ws.column_dimensions[get_column_letter(measures_col)].width or 30.0
+    # 估算用列宽加上限，避免超宽列（如 255.4）导致行数/高度严重低估
+    est_width = max(30.0, min(col_width, 60.0))
+    total_inserted = 0
+    row = start_row
+    while row <= ws.max_row:
+        cell_val = ws.cell(row, measures_col).value
+        text = str(cell_val or "").strip()
+        # 估算该单元格文本所需总高度（简易字符算法，无需逐字精确win32）
+        needed_height = 15.0
+        if text:
+            lines = text.split('\n')
+            total_lines = 0
+            for line in lines:
+                line_width = sum(2.2 if '\u4e00' <= ch <= '\u9fff' else 1.0 for ch in line)
+                total_lines += max(1, math.ceil(line_width / est_width))
+            needed_height = max(15.0, total_lines * 18.0 * 1.15)
+        # 超出 Excel 单行上限 409.5 磅，触发整行插行
+        if needed_height > EXCEL_MAX_ROW_HEIGHT:
+            rows_needed = math.ceil(needed_height / EXCEL_MAX_ROW_HEIGHT)
+            rows_to_insert = rows_needed - 1
+            insert_at = row + 1
+            end_insert_row = insert_at + rows_to_insert - 1
+
+            # 2. 记录当前所有合并区 + 该行独立单格列（插行前）
+            all_merges = [(mr.min_row, mr.min_col, mr.max_row, mr.max_col)
+                          for mr in list(ws.merged_cells.ranges)]
+            single_cols = []
+            for c in range(1, max_col + 1):
+                hit = any(mr.min_row <= row <= mr.max_row and mr.min_col <= c <= mr.max_col
+                          for mr in list(ws.merged_cells.ranges))
+                if not hit:
+                    single_cols.append(c)
+
+            # 3. 解除全部合并（先解除再插行；master 值保留在单元格中）
+            for (min_r, min_c, max_r, max_c) in all_merges:
+                try:
+                    ws.unmerge_cells(start_row=min_r, start_column=min_c, end_row=max_r, end_column=max_c)
+                except Exception:
+                    pass
+
+            # 4. 执行物理插行
+            ws.insert_rows(insert_at, amount=rows_to_insert)
+
+            # 5. 重新合并：原合并区按偏移调整（插行前保留/延伸/下移），独立单格列纵向合并
+            new_merges = []
+            for (min_r, min_c, max_r, max_c) in all_merges:
+                if max_r < row:
+                    new_merges.append((min_r, min_c, max_r, max_c))                      # 之前（标题/表头）
+                elif min_r <= row <= max_r:
+                    if min_r >= start_row:
+                        new_merges.append((min_r, min_c, max_r + rows_to_insert, max_c)) # 涉及插行行：块延伸
+                    else:
+                        new_merges.append((min_r, min_c, max_r, max_c))                  # 表头区：不变
+                else:
+                    new_merges.append((min_r + rows_to_insert, min_c,
+                                       max_r + rows_to_insert, max_c))                    # 之后：整体下移
+            for c in single_cols:
+                new_merges.append((row, c, end_insert_row, c))                           # 独立单格：与新续行合并
+            # 去重（同一单元格范围不重复合并）
+            seen = set()
+            for m in new_merges:
+                if m in seen:
+                    continue
+                seen.add(m)
+                min_r, min_c, max_r, max_c = m
+                try:
+                    ws.merge_cells(start_row=min_r, start_column=min_c, end_row=max_r, end_column=max_c)
+                except Exception:
+                    pass
+                # 6. 复制 master 样式到块内所有行（防止打印断线）
+                src_cell = ws.cell(min_r, min_c)
+                if src_cell.has_style:
+                    for r_new in range(min_r, max_r + 1):
+                        dst_cell = ws.cell(r_new, min_c)
+                        dst_cell.font = src_cell.font.copy()
+                        dst_cell.border = src_cell.border.copy()
+                        dst_cell.fill = src_cell.fill.copy()
+                        dst_cell.alignment = src_cell.alignment.copy()
+
+            # 7. 均匀分配行高到每一个物理行（每行都不超过 409.5）
+            avg_height = round(needed_height / rows_needed, 1)
+            for r_sub in range(row, end_insert_row + 1):
+                ws.row_dimensions[r_sub].height = avg_height
+            print(f"  📏 第{row}行【管控措施】超长({needed_height:.0f}磅)，已插入{rows_to_insert}行续行，所有列全量合并，每行分摊{avg_height}磅")
+            total_inserted += rows_to_insert
+            row = end_insert_row + 1
+        else:
+            # 不插行：保持原行高（不覆盖），避免压缩上报表精心设置的行高
+            row += 1
+    return total_inserted
+
+
+def export_processed_source(cleaned_path, src):
+    """对清洗副本执行【管控措施】列超长插行，导出（第X周）（处理后的源表）.xlsx"""
+    try:
+        wb2 = load_workbook(cleaned_path)
+    except Exception as e:
+        safe_print(f"  ⚠️  无法加载清洗副本进行插行: {e}")
+        return None
+    ws2 = wb2.active
+    inserted = insert_overflow_rows_by_measures(ws2, start_row=3)
+    m = re.search(r'第\s*(\d+)\s*周', os.path.basename(src))
+    if m:
+        out_name = f"（第{m.group(1)}周）（处理后的源表）.xlsx"
+    else:
+        base = os.path.splitext(os.path.basename(src))[0]
+        out_name = f"{base}（处理后的源表）.xlsx"
+    out_path = os.path.join(os.path.dirname(src) or '.', out_name)
+    try:
+        wb2.save(out_path)
+        wb2.close()
+        safe_print(f"  📄 已生成处理后源表（管控措施列插行 {inserted} 行）：{out_name}")
+    except Exception as e:
+        safe_print(f"  ❌ 保存处理后源表失败: {e}")
+        try:
+            wb2.close()
+        except Exception:
+            pass
+        return None
+    return out_path
+
+
 
 def insert_overflow_continuation_rows(ws, start_row, end_row, content_col_start, content_col_end, col_widths):
     """
