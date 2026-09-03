@@ -25564,6 +25564,7 @@ var WeeklyPlan = (() => {
     let inserted = 0;
     let adjusted = 0;
     const insertOps = [];
+    const qRebuild = []; // 管控列需重建的合并区（插行区 + 跳过的跨行合并），末尾统一按偏移重建
     for (let r = maxRow; r >= 3; r--) {
       const cell = ws.getCell(r, measuresIdx);
       const text = cellToText(cell.value);
@@ -25574,7 +25575,11 @@ var WeeklyPlan = (() => {
       let currentTotal = 0;
       for (let i = 0; i < span; i++) currentTotal += (ws.getRow(r + i).height || 15);
       // 不加磅且原行高足够时，保持原样（避免改动源表已有排版）
-      if (measuresPlus === 0 && estimated <= currentTotal) continue;
+      if (measuresPlus === 0 && estimated <= currentTotal) {
+        // 原表该行管控列若为跨行合并（span>1），解除合并后需保留，交给末尾统一重建
+        if (span > 1) qRebuild.push({ top: r, span });
+        continue;
+      }
       // 需要的总高度：在原行高基础上加磅（仿日计划 AutoFitRowEx）
       const requiredHeight = Math.max(currentTotal, estimated) + measuresPlus;
       // 需要的物理行数：按单行上限算出需要几行
@@ -25615,9 +25620,10 @@ var WeeklyPlan = (() => {
         }
       }
       adjusted += rowsNeeded;
-      // 管控列按区重建合并（含插入的续行，向上合并）
+      // 管控列按区重建合并（含插入的续行）——记录到 qRebuild，末尾统一按插行偏移重建，
+      // 避免 spliceRows 不移动合并区导致后续上方插行时错位
       if (rowsNeeded > 1) {
-        try { ws.mergeCells(r, measuresIdx, r + rowsNeeded - 1, measuresIdx); } catch { }
+        qRebuild.push({ top: r, span: rowsNeeded });
       }
     }
     const ops = insertOps.slice().sort((a, b) => a.at - b.at);
@@ -25626,11 +25632,21 @@ var WeeklyPlan = (() => {
       for (const op of ops) if (op.at <= orig) r2 += op.count;
       return r2;
     };
+    // 管控列合并：统一按插行偏移重建（含插行区与保留的跨行合并，如 Q7:Q8）
+    for (const qm of qRebuild) {
+      const top = shiftRow(qm.top);
+      const bottom = shiftRow(qm.top + qm.span - 1);
+      if (bottom > top) {
+        try { ws.mergeCells(top, measuresIdx, bottom, measuresIdx); } catch { }
+      }
+    }
+    // 其余列合并：统一按插行偏移重建
     for (const m of merges) {
       if (m.left === measuresIdx && m.right === measuresIdx) continue;
       const top = shiftRow(m.top);
       const bottom = shiftRow(m.bottom);
-      if (bottom > top) {
+      // 横向合并（bottom==top 但 right>left，如标题 A1:S1）也要重建
+      if (bottom > top || m.right > m.left) {
         try { ws.mergeCells(top, m.left, bottom, m.right); } catch { }
       }
     }
@@ -25802,8 +25818,7 @@ var WeeklyPlan = (() => {
           return;
         }
         const out = await WP.writeProcessedSourceXlsx(processedBuffer, result, plus);
-        const weekMatch = result.sourceName.match(/（第[0-9一二三四五六七八九十百千]+周）/);
-        const name = (weekMatch ? weekMatch[0] : result.sourceName.replace(/\.xlsx$/i, "")) + "（处理后的源表）.xlsx";
+        const name = result.sourceName; // 处理后源表沿用原文件名（不追加"（处理后的源表）"）
         downloadBlob(new Blob([out.buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), name);
         toast("处理后的源表已下载（调整 " + out.adjusted + " 行，插行 " + out.inserted + " 行）");
       }
