@@ -88,7 +88,7 @@
           <p class="eyebrow">Offline desk</p>
           <h1>周计划工作台</h1>
           <p class="lead">
-            离线版：导入作业计划表1，生成周计划明细。关键字段「管控措施」按内容估算行高自动插行，无需手动加磅。
+            只下这个 HTML 即可离线使用。导入表1，整理源表并生成明细；原文件保持只读，自动备份。源表按A3横向打印，字体与加粗保持原样；明细不含管控措施。
           </p>
         </div>
         <div class="actions">
@@ -102,10 +102,15 @@
           <section class="card" id="dropCard">
             <p class="tiny">SOURCE TABLE</p>
             <h2>源表</h2>
-            <p class="muted">标题行含「X月X日—X月X日」，第 2 行为表头。自动跳过示例行 / 填报人行。</p>
+            <p class="muted">自动识别表头，删除示例行和填报人行；三级风险标黄保留。先调整列宽，再计算每行高度，超出409.5磅才插行。</p>
             <input id="file" type="file" accept=".xlsx" hidden />
             <button class="drop" id="drop" type="button">点击或拖入 表1.xlsx</button>
             <p class="muted" id="srcName" style="margin-top:10px">当前：示例</p>
+            <label class="muted" for="measuresPlus">管控措施行高增量（磅）</label>
+            <input id="measuresPlus" type="number" min="0" max="20" step="0.5" value="1" style="width:70px" />
+            <label class="muted"><input id="preserveWidths" type="checkbox" checked /> 保留成品宽列（第37周样式；取消则管控措施收窄至56）</label>
+            <p class="muted" id="sourceStatus" role="status">尚未导入源表</p>
+            <p class="muted">浏览器在本机保存一次备份；也可下载ZIP保存到磁盘。work仅在内存中临时存在，完成即清理。</p>
             <button class="btn-ghost" id="btnSampleSrc" type="button">下载示例表1</button>
           </section>
           
@@ -117,7 +122,8 @@
               <button class="btn" id="btnProcessedSrc">处理后的源表</button>
               <button class="btn-outline" id="btnRisk">三四五级风险 TXT</button>
               <button class="btn-outline" id="btnSum">项目汇总 TXT</button>
-              <a class="btn-outline" href="./weekly-plan-export.py" download="weekly-plan-export.py">下载 Python 脚本</a>
+              <button class="btn-outline" id="btnBackup">下载源文件备份 ZIP</button>
+              <button class="btn-outline" id="btnSourceReport">下载源表处理报告</button>
             </div>
             <p class="muted" id="sumPreview" style="margin-top:10px"></p>
           </section>
@@ -2325,7 +2331,7 @@ var WeeklyPlan = (() => {
         }, { "../utils/col-cache": 19, "../utils/copy-style": 20, "../utils/encryptor": 21, "../utils/under-dash": 26, "./column": 4, "./data-validations": 5, "./enums": 7, "./image": 8, "./range": 10, "./row": 11, "./table": 12 }], 15: [function(e, t, r) {
           "use strict";
           e("core-js/modules/es.promise"), e("core-js/modules/es.promise.finally"), e("core-js/modules/es.object.assign"), e("core-js/modules/es.object.keys"), e("core-js/modules/es.object.values"), e("core-js/modules/es.symbol"), e("core-js/modules/es.symbol.async-iterator"), e("core-js/modules/es.array.iterator"), e("core-js/modules/es.array.includes"), e("core-js/modules/es.array.find-index"), e("core-js/modules/es.array.find"), e("core-js/modules/es.string.from-code-point"), e("core-js/modules/es.string.includes"), e("core-js/modules/es.number.is-nan"), e("regenerator-runtime/runtime");
-          const n = { Workbook: e("./doc/workbook") }, i = e("./doc/enums");
+          const n = { Workbook: e("./doc/workbook"), SourceZip: e(441) }, i = e("./doc/enums");
           Object.keys(i).forEach((e2) => {
             n[e2] = i[e2];
           }), t.exports = n;
@@ -5935,7 +5941,7 @@ var WeeklyPlan = (() => {
               if (t2) {
                 e2.addRollback(), e2.openNode("sheetPr");
                 let r2 = false;
-                r2 = this.map.tabColor.render(e2, t2.tabColor) || r2, r2 = this.map.pageSetUpPr.render(e2, t2.pageSetup) || r2, r2 = this.map.outlinePr.render(e2, t2.outlineProperties) || r2, r2 ? (e2.closeNode(), e2.commit()) : e2.rollback();
+                r2 = this.map.tabColor.render(e2, t2.tabColor) || r2, r2 = this.map.outlinePr.render(e2, t2.outlineProperties) || r2, r2 = this.map.pageSetUpPr.render(e2, t2.pageSetup) || r2, r2 ? (e2.closeNode(), e2.commit()) : e2.rollback();
               }
             }
             parseOpen(e2) {
@@ -23852,6 +23858,7 @@ var WeeklyPlan = (() => {
   // standalone/entry.ts
   var entry_exports = {};
   __export(entry_exports, {
+    sourceProcessor: () => sourceProcessor,
     DEFAULT_MEASURES_PLUS: () => DEFAULT_MEASURES_PLUS,
     parseSourceWorkbook: () => parseSourceWorkbook,
     preprocessSourceBuffer: () => preprocessSourceBuffer,
@@ -24225,8 +24232,8 @@ var WeeklyPlan = (() => {
         jobDesc: buildJobDesc(rec),
         spec: rec.specRaw,
         riskVal: rec.riskRaw,
-        measures: rec.measuresRaw,
-        hasMeasures: Boolean(rec.measuresRaw.trim()),
+        measures: "",
+        hasMeasures: false,
         lRank: rec.lRank,
         pRank: rec.pRank
       };
@@ -25011,7 +25018,7 @@ var WeeklyPlan = (() => {
 
   // src/lib/weekly-plan/pipeline.ts
   function runPipeline(input) {
-    const options = defaultMeasuresOptions(0);
+    const options = defaultMeasuresOptions(input.measuresPlus ?? 1);
     const logs = [...input.extraLogs ?? []];
     const cols = resolveColumns(input.headers);
     logs.push({
@@ -25229,28 +25236,11 @@ var WeeklyPlan = (() => {
     if (!ws) throw new Error("\u5DE5\u4F5C\u7C3F\u4E2D\u6CA1\u6709\u5DE5\u4F5C\u8868");
     unmergeAndFill(ws);
     const logs = [{ level: "info", message: `\u8BFB\u53D6\u6E90\u6587\u4EF6 ${filename}` }];
-    const maxRow = ws.actualRowCount || ws.rowCount;
-    const maxCol = Math.min(ws.actualColumnCount || ws.columnCount || 20, 24);
-    const skip = /* @__PURE__ */ new Set();
-    const scan = Math.min(20, maxRow);
-    for (let r = 1; r <= scan; r++) {
-      const a = cellToText(ws.getCell(r, 1).value);
-      const b = cellToText(ws.getCell(r, 2).value);
-      const reasons = [];
-      if (a && a.length <= 5 && a.includes("\u4F8B")) reasons.push(`\u542B\u300C\u4F8B\u300D('${a}')`);
-      if (isYellowFill(ws.getCell(r, 1))) reasons.push("\u6807\u9EC4");
-      if (hasStrike(ws.getCell(r, 1))) reasons.push("\u5220\u9664\u7EBF");
-      if (reasons.length) {
-        skip.add(r);
-        logs.push({ level: "info", message: `\u8DF3\u8FC7\u793A\u4F8B\u884C \u7B2C${r}\u884C\uFF08${reasons.join("\u3001")}\uFF09` });
-      }
-      if (b === "\u586B\u62A5\u4EBA\u53CA\u8054\u7CFB\u65B9\u5F0F" || b === "\u586B\u62A5\u4EBA") {
-        skip.add(r);
-        logs.push({ level: "info", message: `\u8DF3\u8FC7\u586B\u62A5\u4EBA\u884C \u7B2C${r}\u884C` });
-      }
-    }
+    const maxRow = ws.rowCount;
+    const maxCol = ws.columnCount;
+    const skip = new Set();
     const title = cellToText(ws.getCell(1, 1).value).trim();
-    const headerRow = 2;
+    const {header: headerRow} = sourceProcessor.columnMap(ws);
     const headers = [];
     for (let c = 1; c <= maxCol; c++) {
       const h = cellToText(ws.getCell(headerRow, c).value).replace(/\s+/g, "");
@@ -25258,7 +25248,7 @@ var WeeklyPlan = (() => {
     }
     const timeColIdx = headers.findIndex((h) => h.includes("\u65F6\u95F4") && h.length <= 20);
     const rows = [];
-    for (let r = 3; r <= maxRow; r++) {
+    for (let r = headerRow + 1; r <= maxRow; r++) {
       if (skip.has(r)) continue;
       const obj = {};
       let empty = true;
@@ -25445,214 +25435,525 @@ var WeeklyPlan = (() => {
     return buf;
   }
 
-  function getMergeRowSpan(ws, r) {
-    const merges = (ws.model && ws.model.merges) || [];
-    for (const m of merges) {
-      let top;
-      let bottom;
-      if (m && m.master) {
-        top = m.s ? m.s.row : m.master.row;
-        bottom = m.e ? m.e.row : m.master.row;
-      } else if (m && m.top != null) {
-        top = m.top;
-        bottom = m.bottom;
-      } else {
-        continue;
-      }
-      if (r >= top && r <= bottom) return { start: top, end: bottom };
-    }
-    return { start: r, end: r };
+// BEGIN SOURCE PROCESSOR
+/* Browser source processing. Embedded verbatim by tools/build_html.py; no network dependencies. */
+function createSourceProcessor(ExcelJS) {
+  "use strict";
+  const MAX_HEIGHT = 409.5;
+  const KEYS = {
+    content: ["作业内容", "工作内容", "作业项目", "作业任务"],
+    time: ["作业时间", "工作时间", "计划时间", "起止时间", "时间"],
+    measures: ["管控措施", "控制措施", "防控措施", "风险措施"],
+    person: ["同进同出", "负责人", "人员", "联系人", "姓名"], date: ["日期"], risk:["作业风险等级","风险等级","风险级别"]
+  };
+  const DATE = "(\\d{4})[年/.-](\\d{1,2})[月/.-](\\d{1,2})日?";
+  const CLOCK = "(\\d{1,2}):(\\d{2})";
+  const clone = value => value == null ? value : JSON.parse(JSON.stringify(value));
+  function text(value) {
+    if (value == null) return "";
+    if (value instanceof Date) return `${value.getUTCFullYear()}/${value.getUTCMonth()+1}/${value.getUTCDate()}`;
+    if (value.richText) return value.richText.map(v => v.text).join("");
+    if (typeof value === "object") return text(value.result ?? value.text ?? value.formula ?? "");
+    return String(value);
   }
-  function colNum(letters) {
-    let n = 0;
-    for (let i = 0; i < letters.length; i++) n = n * 26 + (letters.charCodeAt(i) - 64);
-    return n;
+  function report(source) { return {source, stages: [], issues: []}; }
+  function add(log, code, message, cell="", level="warn", details={}) {
+    log.issues.push({source: log.source, code, message, cell, level, ...details});
   }
-  function readSourceMerges(ws) {
-    const out = [];
-    const merges = (ws.model && ws.model.merges) || [];
-    for (const rng of merges) {
-      const m = /^([A-Z]+)(\d+):([A-Z]+)(\d+)$/.exec(String(rng));
-      if (!m) continue;
-      out.push({ top: parseInt(m[2], 10), left: colNum(m[1]), bottom: parseInt(m[4], 10), right: colNum(m[3]) });
-    }
-    return out;
+  function cleanLines(value) {
+    return value.replace(/\r\n?/g, "\n").split("\n").map(v=>v.trim()).join("\n").replace(/\n{3,}/g,"\n\n").trim();
   }
-  async function preprocessSourceBuffer(buffer) {
-    const wb = new import_exceljs.default.Workbook();
-    await wb.xlsx.load(buffer);
-    const ws = wb.worksheets[0];
-    if (!ws) return buffer;
-    const actions = [];
-    const merges0 = readSourceMerges(ws);
-    const bHeader = cellToText(ws.getCell(2, 2).value).replace(/\s+/g, "");
-    if (bHeader.includes("\u586B\u62A5\u4EBA")) {
-      for (const m of merges0) {
-        try { ws.unMergeCells(m.top, m.left, m.bottom, m.right); } catch { }
-      }
-      ws.spliceColumns(2, 1);
-      for (const m of merges0) {
-        let nl = m.left, nr = m.right;
-        if (m.left > 2) { nl = m.left - 1; nr = m.right - 1; }
-        else if (m.left === 2 || m.right >= 2) { nl = Math.max(1, m.left - 1); nr = m.right - 1; }
-        if (nr >= nl) {
-          try { ws.mergeCells(m.top, nl, m.bottom, nr); } catch { }
-        }
-      }
-      actions.push("\u5DF2\u5220\u9664B\u5217\uFF08\u586B\u62A5\u4EBA\u53CA\u8054\u7CFB\u65B9\u5F0F\uFF09");
-    } else {
-      actions.push("\u672AB\u5217\u4E0D\u662F\u586B\u62A5\u4EBA\u5217\uFF0C\u8DF3\u8FC7\u5220\u5217");
-    }
-    let deletedRows = 0;
-    for (let r = ws.rowCount; r >= 3; r--) {
-      const v = cellToText(ws.getCell(r, 1).value);
-      if (v.includes("\u4F8B")) {
-        const span = getMergeRowSpan(ws, r);
-        const start = Math.max(3, span.start);
-        const count = span.end - start + 1;
-        ws.spliceRows(start, count);
-        deletedRows += count;
-        r = start - 1;
-      }
-    }
-    if (actions.length || deletedRows) {
-      const buf = await wb.xlsx.writeBuffer();
-      return { buffer: buf, actions, deletedRows };
-    }
-    return { buffer, actions, deletedRows: 0 };
+  function width(value) {
+    // Unicode W/F ranges, including Chinese punctuation and fullwidth ASCII.
+    return Array.from(value).reduce((n,ch)=> {
+      const c=ch.codePointAt(0);
+      const wide = c>=0x1100 && (c<=0x115f || c===0x2329 || c===0x232a ||
+        (c>=0x2e80 && c<=0xa4cf && c!==0x303f) || (c>=0xac00 && c<=0xd7a3) ||
+        (c>=0xf900 && c<=0xfaff) || (c>=0xfe10 && c<=0xfe19) ||
+        (c>=0xfe30 && c<=0xfe6f) || (c>=0xff01 && c<=0xff60) ||
+        (c>=0xffe0 && c<=0xffe6) || (c>=0x1f300 && c<=0x1faff) || c>=0x20000);
+      return n+(wide?2.2:1);
+    },0);
   }
-  async function writeProcessedSourceXlsx(buffer, parsed, measuresPlus) {
-    const wb = new import_exceljs.default.Workbook();
-    await wb.xlsx.load(buffer);
-    const ws = wb.worksheets[0];
-    if (!ws) throw new Error("\u6E90\u8868\u65E0\u5DE5\u4F5C\u8868");
-    const cols = resolveColumns(parsed.headers);
-    if (!cols.measures) {
-      return { buffer: await wb.xlsx.writeBuffer(), adjusted: 0, inserted: 0 };
-    }
-    const measuresIdx = parsed.headers.indexOf(cols.measures) + 1;
-    if (measuresIdx <= 0) {
-      return { buffer: await wb.xlsx.writeBuffer(), adjusted: 0, inserted: 0 };
-    }
-    // 管控措施列估算行高时按合理列宽（源表 Q 列可能很宽如 255，打印缩放后需分行插行）
-    const colWidthRaw = ws.getColumn(measuresIdx).width || 30;
-    const colWidth = Math.min(colWidthRaw, 60);
-    const maxRow = ws.rowCount;
-    const merges = readSourceMerges(ws);
-    // 记录管控列每行的原始合并跨度（如 Q7:Q8 → 行7、行8 跨度2）
-    const spanOf = {};
-    for (const m of merges) {
-      if (m.left === measuresIdx && m.right === measuresIdx) {
-        const sp = m.bottom - m.top + 1;
-        for (let rr = m.top; rr <= m.bottom; rr++) spanOf[rr] = sp;
+  function colNumber(s) { return Array.from(s).reduce((n,c)=>n*26+c.charCodeAt(0)-64,0); }
+  function colLetter(n) { let s=""; for(;n;n=Math.floor((n-1)/26)) s=String.fromCharCode(65+(n-1)%26)+s; return s; }
+  function range(s) {
+    const m=/^\$?([A-Z]+)\$?(\d+)(?::\$?([A-Z]+)\$?(\d+))?$/.exec(s);
+    if(!m) throw new Error(`合并区/区域格式异常：${s}`);
+    return [+m[2],colNumber(m[1]),+(m[4]||m[2]),colNumber(m[3]||m[1])];
+  }
+  const rangeText = ([t,l,b,r])=>`${colLetter(l)}${t}:${colLetter(r)}${b}`;
+  function merges(ws, log) {
+    const ranges=(ws.model.merges||[]).map(range);
+    for(let i=0;i<ranges.length;i++) for(let j=0;j<i;j++) {
+      const a=ranges[i], b=ranges[j];
+      if(a[0]<=b[2] && b[0]<=a[2] && a[1]<=b[3] && b[1]<=a[3]) {
+        add(log,"MERGE_INVALID",`合并区重叠：${rangeText(a)} / ${rangeText(b)}`,"","error");
+        throw new Error("合并区异常，停止导出以保护数据");
       }
     }
-    // 解除全部合并
-    for (const m of merges) {
-      try { ws.unMergeCells(m.top, m.left, m.bottom, m.right); } catch { }
+    return ranges;
+  }
+  function detach(ws, ranges) {
+    const styles=[];
+    for(const [t,l,b,r] of ranges) for(let rr=t;rr<=b;rr++) for(let c=l;c<=r;c++) styles.push([rr,c,clone(ws.getCell(rr,c).style)]);
+    for(const m of ranges) ws.unMergeCells(...m);
+    for(const [r,c,style] of styles) ws.getCell(r,c).style=style;
+  }
+  function attach(ws, ranges) {
+    for(const m of ranges) if(m[0]!==m[2] || m[1]!==m[3]) {
+      // ExcelJS otherwise links every slave's style object to the master.
+      const styles=[];
+      for(let r=m[0];r<=m[2];r++) for(let c=m[1];c<=m[3];c++) styles.push([r,c,clone(ws.getCell(r,c).style)]);
+      ws.mergeCells(...m);
+      for(const [r,c,s] of styles) ws.getCell(r,c).style=s;
     }
-    // 清空合并区域非主单元格的值引用：exceljs 加载后合并 slave 的 value 会指向
-    // master，spliceRows 移动行时会把 master 值带到新位置，导致内容重复错位。
-    for (const m of merges) {
-      for (let rr = m.top; rr <= m.bottom; rr++) {
-        for (let cc = m.left; cc <= m.right; cc++) {
-          if (rr === m.top && cc === m.left) continue;
-          try { ws.getCell(rr, cc).value = null; } catch { }
-        }
+  }
+  function columnMap(ws) {
+    function mapping(r) {
+      const result={};
+      for(const [key,words] of Object.entries(KEYS)) {
+        result[key]=[];
+        for(let c=1;c<=ws.columnCount;c++) if(words.some(w=>text(ws.getCell(r,c).value).replace(/\s+/g,"").includes(w))) result[key].push(c);
       }
+      return result;
     }
-    let inserted = 0;
-    let adjusted = 0;
-    const insertOps = [];
-    const qRebuild = []; // 管控列需重建的合并区（插行区 + 跳过的跨行合并），末尾统一按偏移重建
-    for (let r = maxRow; r >= 3; r--) {
-      const cell = ws.getCell(r, measuresIdx);
-      const text = cellToText(cell.value);
-      if (!text.trim()) continue;
-      const estimated = estimateTextHeight(text, colWidth);
-      const span = spanOf[r] || 1;
-      // 当前合并区总高（含 slave 行原高）
-      let currentTotal = 0;
-      for (let i = 0; i < span; i++) currentTotal += (ws.getRow(r + i).height || 15);
-      // 不加磅且原行高足够时，保持原样（避免改动源表已有排版）
-      if (measuresPlus === 0 && estimated <= currentTotal) {
-        // 原表该行管控列若为跨行合并（span>1），解除合并后需保留，交给末尾统一重建
-        if (span > 1) qRebuild.push({ top: r, span });
-        continue;
+    let best=-1, header=2, cols;
+    for(let r=1;r<=Math.min(ws.rowCount,20);r++) {
+      const cm=mapping(r), score=Object.values(cm).filter(v=>v.length).length;
+      if(score>best) { best=score; header=r; cols=cm; }
+    }
+    if(!cols) throw new Error("工作表为空，未找到表头");
+    return {header,cols};
+  }
+  function yellow(cell) {
+    const f=cell.fill;
+    if(f?.type!=="pattern" || f.pattern!=="solid") return false;
+    if([5,13].includes(f.fgColor?.indexed)) return true;
+    const rgb=f.fgColor?.argb;
+    if(!rgb || rgb.length<6) return false;
+    const s=rgb.slice(-6);
+    return parseInt(s.slice(0,2),16)>=220 && parseInt(s.slice(2,4),16)>=200 && parseInt(s.slice(4,6),16)<=170;
+  }
+  function dateFrom(parts) {
+    const [y,m,d]=parts.map(Number), v=new Date(Date.UTC(y,m-1,d));
+    if(y<100 || v.getUTCFullYear()!==y || v.getUTCMonth()!==m-1 || v.getUTCDate()!==d) throw new Error("日期非法");
+    return v;
+  }
+  function validateTime(value, log, cell, dateValue="") {
+    const original=value;
+    let s=value.normalize("NFKC").replace(/：/g,":").replace(/[—–~～]|至|到/g,"-");
+    const dates=[...s.matchAll(new RegExp(DATE,"g"))], clocks=[...s.matchAll(new RegExp(CLOCK,"g"))];
+    let ds=[];
+    try {
+      ds=dates.map(m=>dateFrom(m.slice(1)));
+      if(!dates.length && dateValue) {
+        const dm=new RegExp(`^${DATE}$`).exec(text(dateValue).trim());
+        if(!dm) throw new Error("日期列不能解析");
+        ds=[dateFrom(dm.slice(1))];
       }
-      // 需要的总高度：在原行高基础上加磅（仿日计划 AutoFitRowEx）
-      const requiredHeight = Math.max(currentTotal, estimated) + measuresPlus;
-      // 需要的物理行数：按单行上限算出需要几行
-      const rowsNeeded = Math.max(span, Math.ceil((requiredHeight + 0.5) / EXCEL_MAX_ROW_HEIGHT));
-      const rowsToInsert = rowsNeeded - span;
-      if (rowsToInsert > 0) {
-        for (let i = 0; i < rowsToInsert; i++) {
-          try {
-            ws.spliceRows(r + span, 0, {});
-            insertOps.push({ at: r + span, count: 1 });
-            inserted += 1;
-          } catch { }
-        }
+    } catch {
+      add(log,"DATE_INVALID","日期非法，保留原值",cell,"error",{value:original}); return [original,[]];
+    }
+    if(!ds.length) add(log,"TIME_DATE_MISSING","时间缺少可确定的日期，保留原值",cell,"error",{value:original});
+    if(clocks.length!==2) {
+      add(log,"TIME_FORMAT","需两个完整时刻（如08:30-17:30），未自动补造时刻",cell,"error",{value:original}); return [original,ds];
+    }
+    const times=clocks.map(m=>m.slice(1).map(Number));
+    if(times.some(([h,m])=>h>24 || m>59 || (h===24 && m!==0)) || times[0][0]===24) {
+      add(log,"TIME_INVALID","时刻超出范围；24:00只允许作结束时间",cell,"error",{value:original}); return [original,ds];
+    }
+    const remainder=s.replace(new RegExp(CLOCK,"g"),"").replace(new RegExp(DATE,"g"),"");
+    if(dates.length>2 || remainder.replace(/[\s-]/g,"") || (dates.length && (dates[0].index>clocks[0].index || (dates.length===2 && !(clocks[0].index+clocks[0][0].length<=dates[1].index && dates[1].index<clocks[1].index))))) {
+      add(log,"TIME_FORMAT","时间格式无法唯一解析，保留原值",cell,"error",{value:original}); return [original,ds];
+    }
+    if(ds.length) {
+      const start=+ds[0]+(times[0][0]*60+times[0][1])*60000, end=+ds[ds.length-1]+(times[1][0]*60+times[1][1])*60000;
+      if(end<=start) { add(log,"TIME_ORDER","结束时间不晚于开始时间；跨夜请明确结束日期",cell,"error",{value:original}); return [original,ds]; }
+    }
+    const firstEnd=clocks[0].index+clocks[0][0].length;
+    if(!/^\s*-/.test(s.slice(firstEnd,clocks[1].index))) s=s.slice(0,firstEnd)+"-"+s.slice(firstEnd);
+    if(s!==original) add(log,"TIME_FIXED","已统一时间符号或补上两个时刻间的“-”",cell,"info",{before:original,after:s});
+    return [s,ds];
+  }
+  function contextRange(value, year, log, label) {
+    const full=[...value.matchAll(new RegExp(DATE,"g"))];
+    try {
+      if(full.length) {
+        const ds=full.map(m=>dateFrom(m.slice(1)));
+        if(ds[ds.length-1]<ds[0]) throw new Error();
+        return [ds[0],ds[ds.length-1]];
       }
-      // 行高处理：插行（rowsNeeded>span）时均分总高；不插行时保持原高并加 diff（超上限移交下一行）
-      if (rowsNeeded > span) {
-        const per = Math.min(EXCEL_MAX_ROW_HEIGHT, requiredHeight / rowsNeeded);
-        for (let i = 0; i < rowsNeeded; i++) {
-          try { ws.getRow(r + i).height = per; } catch { }
-        }
-      } else {
-        const diff = requiredHeight - currentTotal;
-        if (diff > 0) {
-          let leftover = 0;
-          for (let i = 0; i < rowsNeeded; i++) {
-            const row = r + i;
-            const curH = ws.getRow(row).height || 15;
-            const add = Math.round(diff / rowsNeeded + leftover / (rowsNeeded - i));
-            let actualAdd = add;
-            if (curH + add > EXCEL_MAX_ROW_HEIGHT) {
-              actualAdd = EXCEL_MAX_ROW_HEIGHT - curH;
-              leftover += add - actualAdd;
-            }
-            if (actualAdd > 0) {
-              try { ws.getRow(row).height = curH + actualAdd; } catch { }
-            }
+      const m=/(\d{1,2})[月.](\d{1,2})日?\s*[-—–~～至]\s*(\d{1,2})[月.](\d{1,2})日?/.exec(value);
+      if(m && year) return [dateFrom([year,+m[1],+m[2]]), dateFrom([year+(+m[3]<+m[1]?1:0),+m[3],+m[4]])];
+    } catch { add(log,"DATE_CONTEXT_INVALID",`${label}日期非法，保留原值`,"","error"); }
+    return null;
+  }
+  function moveReferences(ws, map) {
+    const move=value=>String(value).split(/\s+/).map(part=> {
+      const m=range(part), kept=[];
+      for(let r=m[0];r<=m[2];r++) if(map(r)!=null) kept.push(map(r));
+      return kept.length?rangeText([Math.min(...kept),m[1],Math.max(...kept),m[3]]):"";
+    }).filter(Boolean).join(" ");
+    if(ws.pageSetup.printArea) ws.pageSetup.printArea=ws.pageSetup.printArea.split("&&").map(move).filter(Boolean).join("&&");
+    if(ws.pageSetup.printTitlesRow) {
+      const [a,b]=ws.pageSetup.printTitlesRow.split(":").map(Number);
+      ws.pageSetup.printTitlesRow=`${map(a)||a}:${map(b)||b}`;
+    }
+    if(typeof ws.autoFilter==="string") ws.autoFilter=move(ws.autoFilter)||undefined;
+    for(const br of ws.rowBreaks||[]) br.id=map(br.id)||map(br.id-1)||1;
+    for(const view of ws.views||[]) if(view.state==="frozen" && view.ySplit) view.ySplit=(map(view.ySplit+1)||view.ySplit+1)-1;
+    const validations=ws.dataValidations.model, updated={};
+    for(const [key,v] of Object.entries(validations)) { const ref=move(key); if(ref) updated[ref]=v; }
+    ws.dataValidations.model=updated;
+  }
+  function preprocess(ws, log) {
+    log.stages.push("preprocess");
+    const {header,cols}=columnMap(ws);
+    for(const key of ["content","time","measures"]) if(!cols[key].length) add(log,key==="measures"?"MEASURES_MISSING":"COLUMN_MISSING",`必需列未找到：${KEYS[key][0]}`,"","error");
+    for(const key of ["content","time","date"]) if(cols[key].length>1) add(log,"COLUMN_AMBIGUOUS",`发现多个${KEYS[key][0]}列，逐列校验，不猜列位置`);
+    const ranges=merges(ws,log), deleted=[];
+    const maxRow=ws.rowCount, maxCol=ws.columnCount;
+    for(let r=header+1;r<=maxRow;r++) {
+      const cells=Array.from({length:maxCol},(_,i)=>ws.getCell(r,i+1));
+      const anchors=cells.filter(c=>!c.isMerged || c.master===c);
+      const riskCol=cols.risk.find(c=>text(ws.getCell(header,c).value).includes("作业"))||cols.risk[0];
+      const riskValue=riskCol?text(ws.getCell(r,riskCol).value):"";
+      const third=/(?:三|3|Ⅲ|III)\s*级|^\s*3\s*$/i.test(riskValue);
+      const known=third || /(?:一|二|四|五|六|[12456]|IV|VI|II|V|I)\s*级|^\s*[12456]\s*$/i.test(riskValue);
+      const hasYellow=anchors.some(yellow);
+      if(hasYellow && (third || !known)) add(log,"YELLOW_RISK_KEPT",third?"三级风险标黄行保留":"标黄行风险级别无法确定，保留待核对",`${ws.name}!A${r}`,third?"info":"warn");
+      const example=["例","示例"].includes(text(cells[0].value).trim()) || anchors.some(c=>c.font?.strike || c.value?.richText?.some(v=>v.font?.strike)) || (hasYellow && known && !third);
+      const filler=anchors.some(c=>/^填报人(?:及联系方式)?(?:\s*[:：].*)?$/.test(text(c.value).trim()));
+      if(example || filler) { deleted.push(r); add(log,"ROW_DELETED",example?"删除示例行":"删除填报人行",`${ws.name}!A${r}`,"info",{original_row:r}); }
+    }
+    if(deleted.length) {
+      const anchors=ranges.map(m=>clone(ws.getCell(m[0],m[1]).value));
+      const anchorStyles=ranges.map(m=>clone(ws.getCell(m[0],m[1]).style));
+      detach(ws,ranges);
+      const map=r=>deleted.includes(r)?null:r-deleted.filter(d=>d<r).length;
+      moveReferences(ws,map);
+      for(const r of deleted.slice().reverse()) ws.spliceRows(r,1);
+      const rebuilt=[];
+      ranges.forEach(([t,l,b,r],i)=> {
+        const kept=[]; for(let rr=t;rr<=b;rr++) if(map(rr)!=null) kept.push(map(rr));
+        if(kept.length) {
+          if(deleted.includes(t)) {
+            ws.getCell(kept[0],l).value=anchors[i]; ws.getCell(kept[0],l).style=anchorStyles[i];
+            add(log,"MERGE_ANCHOR_MOVED","删除合并首行，原正文及样式已移到剩余区域首格",`${ws.name}!${colLetter(l)}${t}`,"info");
           }
+          rebuilt.push([kept[0],l,kept[kept.length-1],r]);
+        }
+      });
+      attach(ws,rebuilt);
+    }
+    const dataDates=[];
+    for(let r=header+1;r<=ws.rowCount;r++) {
+      if(!Array.from({length:maxCol},(_,c)=>ws.getCell(r,c+1)).some(c=>c.value!=null)) continue;
+      let originalRow=r; for(const d of deleted) if(d<=originalRow) originalRow++;
+      for(let c=1;c<=maxCol;c++) {
+        const cell=ws.getCell(r,c), addr=`${ws.name}!${colLetter(c)}${originalRow}`;
+        if((cell.isMerged && cell.master!==cell) || cell.value?.formula || cell.value?.sharedFormula) continue;
+        if(typeof cell.value==="string") {
+          cell.value=cleanLines(cell.value);
+          if(cols.person.includes(c) && cell.value.includes("\n") && /(?:1\d{10}|0\d{2,3}-?\d{7,8})/.test(cell.value)) cell.value=cell.value.replace(/\s*\n\s*/g,"");
+        }
+        if(cols.date.includes(c) && cell.value!=null) {
+          try {
+            const dm=new RegExp(`^${DATE}$`).exec(text(cell.value));
+            if(!dm) throw new Error();
+            dataDates.push([dateFrom(dm.slice(1)),addr]);
+          } catch { add(log,"DATE_INVALID","日期列非法或无法解析，保留原值",addr,"error",{value:text(cell.value)}); }
+        }
+        if(cols.time.includes(c)) {
+          const [value,ds]=validateTime(text(cell.value),log,addr,cols.date.length===1?ws.getCell(r,cols.date[0]).value:"");
+          if(typeof cell.value==="string") cell.value=value;
+          dataDates.push(...ds.map(d=>[d,addr]));
         }
       }
-      adjusted += rowsNeeded;
-      // 管控列按区重建合并（含插入的续行）——记录到 qRebuild，末尾统一按插行偏移重建，
-      // 避免 spliceRows 不移动合并区导致后续上方插行时错位
-      if (rowsNeeded > 1) {
-        qRebuild.push({ top: r, span: rowsNeeded });
-      }
     }
-    const ops = insertOps.slice().sort((a, b) => a.at - b.at);
-    const shiftRow = (orig) => {
-      let r2 = orig;
-      for (const op of ops) if (op.at <= orig) r2 += op.count;
-      return r2;
-    };
-    // 管控列合并：统一按插行偏移重建（含插行区与保留的跨行合并，如 Q7:Q8）
-    for (const qm of qRebuild) {
-      const top = shiftRow(qm.top);
-      const bottom = shiftRow(qm.top + qm.span - 1);
-      if (bottom > top) {
-        try { ws.mergeCells(top, measuresIdx, bottom, measuresIdx); } catch { }
-      }
-    }
-    // 其余列合并：统一按插行偏移重建
-    for (const m of merges) {
-      if (m.left === measuresIdx && m.right === measuresIdx) continue;
-      const top = shiftRow(m.top);
-      const bottom = shiftRow(m.bottom);
-      // 横向合并（bottom==top 但 right>left，如标题 A1:S1）也要重建
-      if (bottom > top || m.right > m.left) {
-        try { ws.mergeCells(top, m.left, bottom, m.right); } catch { }
-      }
-    }
-    const buf = await wb.xlsx.writeBuffer();
-    return { buffer: buf, adjusted, inserted };
+    let title=""; for(let r=1;r<header;r++) for(let c=1;c<=maxCol;c++) { const cell=ws.getCell(r,c); if(!cell.isMerged || cell.master===cell) title+=" "+text(cell.value); }
+    title=title.trim();
+    const yearMatch=/(20\d{2})(?!\d)/.exec(title+" "+log.source);
+    const year=yearMatch?+yearMatch[1]:(dataDates.length?Math.min(...dataDates.map(([d])=>d.getUTCFullYear())):null);
+    const contexts=[["标题",contextRange(title,year,log,"标题")],["文件名",contextRange(log.source,year,log,"文件名")]];
+    if(contexts.every(([,r])=>r) && contexts[0][1].some((d,i)=>+d!==+contexts[1][1][i])) add(log,"DATE_CONTEXT_MISMATCH","标题与文件名日期范围不一致","","error");
+    for(const [label,rng] of contexts) if(rng) for(const [d,addr] of dataDates) if(d<rng[0] || d>rng[1]) add(log,"DATE_MISMATCH",`日期 ${d.toISOString().slice(0,10)} 不在${label}日期范围内`,addr,"error");
+    const weeks=[title,log.source].map(v=>/第\s*([0-9一二三四五六七八九十百]+)\s*周/.exec(v));
+    if(weeks.every(Boolean) && weeks[0][1]!==weeks[1][1]) add(log,"WEEK_MISMATCH","标题与文件名周次不一致，输出命名采用文件名周次","","error");
+    if(!contexts.some(([,r])=>r)) add(log,"DATE_CONTEXT_MISSING","标题/文件名未找到可确定日期范围，未将业务周次强行当作ISO周次");
+    let formulas=false; ws.eachRow(row=>row.eachCell(cell=>{if(cell.value?.formula || cell.value?.sharedFormula) formulas=true;}));
+    if(formulas || ws.getTables().length || ws.conditionalFormattings?.length) add(log,"REFERENCE_REVIEW","源表含公式、表格或条件格式；插删行后请核对相关引用");
+    return {header,cols,title,deletedRows:deleted.length};
   }
+  function autoWidth(ws, header, cols, log, preserveWidths=false) {
+    log.stages.push("width");
+    for(let c=1;c<=ws.columnCount;c++) {
+      let longest=0;
+      for(let r=header;r<=ws.rowCount;r++) {
+        const cell=ws.getCell(r,c);
+        if(cell.isMerged && cell.master!==cell) continue;
+        for(const line of text(cell.value).split("\n")) longest=Math.max(longest,width(line));
+      }
+      const target=Math.max(8,Math.min(cols.measures.includes(c)?56:48,longest+2.4));
+      ws.getColumn(c).width=cols.measures.includes(c)&&!preserveWidths?target:Math.max(ws.getColumn(c).width||13,target);
+    }
+  }
+  function autoHeight(ws, cols, log, plus=1) {
+    if(!Number.isFinite(plus) || plus<0) throw new Error("管控措施行高增量必须为非负有限数字");
+    log.stages.push("height");
+    const ranges=merges(ws,log), needed=new Map(), vertical=[];
+    for(let r=1;r<=ws.rowCount;r++) {
+      let height=15;
+      for(let c=1;c<=ws.columnCount;c++) {
+        const cell=ws.getCell(r,c);
+        if(cell.isMerged && cell.master!==cell) continue;
+        cell.alignment={...cell.alignment,wrapText:true,vertical:"middle"};
+        const value=text(cell.value); if(!value) continue;
+        const m=ranges.find(m=>m[0]===r && m[1]===c)||[r,c,r,c];
+        let colWidth=0; for(let cc=c;cc<=m[3];cc++) colWidth+=ws.getColumn(cc).width;
+        const size=cell.font?.size||11;
+        const lines=value.split("\n").reduce((n,s)=>n+Math.max(1,Math.ceil(width(s)*size/11/Math.max(1,colWidth-2.4))),0);
+        const h=Math.max(18,lines*size*1.5+6)+((cols.measures.includes(c)||value.includes("管控措施"))?plus:0);
+        if(m[2]>r) vertical.push([r,m[2],h]);
+        else height=Math.max(height,h);
+      }
+      needed.set(r,height);
+    }
+    // Add only the unmet height to a vertical merge's first row.
+    for(const [top,bottom,required] of vertical.sort((a,b)=>(a[1]-a[0])-(b[1]-b[0]))) {
+      let available=0;for(let r=top;r<=bottom;r++) available+=needed.get(r);
+      needed.set(top,needed.get(top)+Math.max(0,required-available));
+    }
+    for(const [r,height] of needed) ws.getRow(r).height=height;
+    return needed;
+  }
+  function splitOverflow(ws, needed, log) {
+    log.stages.push("insert");
+    const ranges=merges(ws,log), maxCol=ws.columnCount;
+    detach(ws,ranges);
+    let inserted=0;
+    for(const [r,required] of [...needed].reverse()) {
+      if(required<=MAX_HEIGHT) continue;
+      const count=Math.ceil(required/MAX_HEIGHT)-1;
+      if(ws.rowCount+count>1048576) throw new Error("插行将超出Excel最大行数");
+      const styles=Array.from({length:maxCol},(_,c)=>clone(ws.getCell(r,c+1).style));
+      const covered=new Set();
+      for(const [t,l,b,rr] of ranges) if(t<=r && r<=b) for(let c=l;c<=rr;c++) covered.add(c);
+      moveReferences(ws,old=>old>r?old+count:old);
+      // Required order: insert, copy styles, finally rebuild merges after all row moves.
+      for(let i=0;i<count;i++) ws.spliceRows(r+1,0,[]);
+      for(let nr=r+1;nr<=r+count;nr++) for(let c=1;c<=maxCol;c++) ws.getCell(nr,c).style=clone(styles[c-1]);
+      for(let nr=r;nr<=r+count;nr++) ws.getRow(nr).height=required/(count+1);
+      for(const m of ranges) { if(m[0]>r) m[0]+=count; if(m[2]>=r) m[2]+=count; }
+      for(let c=1;c<=maxCol;c++) if(!covered.has(c)) ranges.push([r,c,r+count,c]);
+      inserted+=count;
+      add(log,"ROW_SPLIT",`整行需求${required.toFixed(1)}磅，分摊至${count+1}行`,`${ws.name}!A${r}`,"info",{inserted:count});
+    }
+    attach(ws,ranges);
+    for(let r=1;r<=ws.rowCount;r++) for(let c=1;c<=maxCol;c++) {
+      const cell=ws.getCell(r,c); cell.alignment={...cell.alignment,wrapText:true,vertical:"middle"};
+    }
+    return inserted;
+  }
+  function outputName(filename, title="") {
+    const stem=filename.replace(/\.xlsx$/i,"");
+    const m=/第\s*([0-9一二三四五六七八九十百]+)\s*周/.exec(stem)||/第\s*([0-9一二三四五六七八九十百]+)\s*周/.exec(title);
+    return (m?`（第${m[1]}周）`:stem)+"（处理后的源表）.xlsx";
+  }
+  function setupSourcePrint(ws, header, cols, log) {
+    const originalScale=ws.pageSetup.scale;
+    let printCol=ws.columnCount;
+    if(ws.pageSetup.printArea) {
+      const right=ws.pageSetup.printArea.split('&&').map(s=>range(s)[3]).reduce((n,c)=>Math.max(n,c),0);
+      if(right>=Math.max(...cols.measures)) printCol=Math.min(printCol,right);
+    }
+    ws.pageSetup={...ws.pageSetup,orientation:"landscape",paperSize:8,fitToPage:true,fitToWidth:1,fitToHeight:0,
+      margins:{left:0.3,right:0.3,top:0.35,bottom:0.35,header:0.15,footer:0.15},
+      printArea:`A1:${colLetter(printCol)}${ws.rowCount}`,printTitlesRow:`1:${header}`};
+    delete ws.pageSetup.scale;
+    ws.rowBreaks=[];
+    let widthPoints=0;
+    for(let c=1;c<=printCol;c++) widthPoints+=(ws.getColumn(c).width*7+5)*0.75;
+    let scale=Math.min(1,Math.max(0.1,(1190.55-43.2)/widthPoints));
+    if(originalScale>=10 && originalScale<=400 && widthPoints*originalScale/100<=1147.35) {
+      ws.pageSetup.scale=originalScale;ws.pageSetup.fitToPage=false;scale=originalScale/100;
+    }
+    let headerHeight=0;for(let r=1;r<=header;r++) headerHeight+=ws.getRow(r).height||15;
+    const budget=(841.89-50.4-24)/scale-headerHeight;
+    const ranges=merges(ws,log);
+    const totalHeight=(a,b)=>{let h=0;for(let r=a;r<=b;r++) h+=ws.getRow(r).height||15;return h;};
+    const pageBreak=r=>ws.getRow(r).addPageBreak(0,ws.columnCount-1);
+    let used=0,r=header+1;
+    while(r<=ws.rowCount) {
+      const end=Math.max(r,...ranges.filter(m=>m[0]<=r && r<=m[2] && m[1]<=2 && m[3]<=2).map(m=>m[2]));
+      const total=totalHeight(r,end);
+      if(total<=budget) {
+        if(used && used+total>budget) {pageBreak(r-1);used=0;}
+        used+=total;
+      } else {
+        if(used) {pageBreak(r-1);used=0;}
+        let rr=r;
+        while(rr<=end) {
+          const atomicEnd=Math.min(end,Math.max(rr,...ranges.filter(m=>m[0]<=rr && rr<=m[2] && cols.measures.some(c=>m[1]<=c && c<=m[3])).map(m=>m[2])));
+          const height=totalHeight(rr,atomicEnd);
+          if(used && used+height>budget) {pageBreak(rr-1);used=0;}
+          if(height>budget) add(log,"PRINT_BLOCK_OVERSIZE","单个管控措施合并块超过A3一页可用高度，请核对打印预览；未截断或删除正文",`${ws.name}!A${rr}`);
+          used+=height;rr=atomicEnd+1;
+        }
+      }
+      r=end+1;
+    }
+    const mode=ws.pageSetup.scale?`保留原打印缩放${originalScale}%`:'宽度一页、高度不限';
+    add(log,"A3_PRINT",`A3横向、${mode}；已按作业/管控措施合并块设置${ws.rowBreaks.length}处分分页，原字体和加粗保留`,"","info");
+  }
+  function isSource(filename) {
+    return /\.xlsx$/i.test(filename) && !/(?:^|[\\/])~\$|明细|处理后|(?:^|[\\/])work(?:[\\/]|$)|源文件备份/i.test(filename);
+  }
+  async function trimInflatedCopy(buffer, log) {
+    const zip=await ExcelJS.SourceZip.loadAsync(buffer);
+    const book=await zip.file('xl/workbook.xml').async('string');
+    const first=/<sheet\b[^>]*\br:id="([^"]+)"/.exec(book);
+    if(!first) return buffer;
+    const rels=await zip.file('xl/_rels/workbook.xml.rels').async('string');
+    const rel=[...rels.matchAll(/<Relationship\b[^>]*\/>/g)].find(m=>new RegExp(`\\bId="${first[1]}"`).test(m[0]));
+    if(!rel) return buffer;
+    const target=/\bTarget="([^"]+)"/.exec(rel[0])[1];
+    const name=target.startsWith('/')?target.slice(1):'xl/'+target;
+    let xml=await zip.file(name).async('string');
+    const cellRE=/<c\b[^>]*?(?:\/>|>[\s\S]*?<\/c>)/g;
+    const cells=[...xml.matchAll(cellRE)];
+    const col=s=>colNumber(/\br="([A-Z]+)\d+"/.exec(s)[1]);
+    const populated=cells.filter(m=>/<(?:v|is|f)(?:\s|>)/.test(m[0])).map(m=>col(m[0]));
+    if(!populated.length) return buffer;
+    let bound=populated.reduce((n,c)=>Math.max(n,c),0);
+    const ranges=[...xml.matchAll(/<mergeCell\b[^>]*\bref="([^"]+)"[^>]*\/>/g)].map(m=>m[1]);
+    for(const ref of ranges) {const m=range(ref);if(m[1]<=bound) bound=Math.max(bound,m[3]);}
+    const actual=cells.reduce((n,m)=>Math.max(n,col(m[0])),0);
+    if(actual<=bound+256) return buffer;
+    xml=xml.replace(cellRE,m=>col(m)<=bound?m:'');
+    const kept=ranges.filter(ref=>range(ref)[1]<=bound);
+    xml=xml.replace(/<mergeCells\b[^>]*>[\s\S]*?<\/mergeCells>/,()=>`<mergeCells count="${kept.length}">${kept.map(ref=>`<mergeCell ref="${ref}"/>`).join('')}</mergeCells>`);
+    xml=xml.replace(/<col\b[^>]*\/>/g,m=>+(/\bmin="(\d+)"/.exec(m)[1])>bound?'':m.replace(/\bmax="(\d+)"/,(_,hi)=>`max="${Math.min(bound,+hi)}"`));
+    xml=xml.replace(/<dimension\b[^>]*\/>/,'');
+    zip.file(name,xml);
+    add(log,'EMPTY_FORMAT_TRIMMED',`工作副本移除${colLetter(bound+1)}列以外的远端空白格式及${ranges.length-kept.length}个空合并；正文未改`,'','info');
+    return zip.generateAsync({type:'uint8array',compression:'DEFLATE'});
+  }
+  async function load(buffer, log) {
+    const wb=new ExcelJS.Workbook(); await wb.xlsx.load(await trimInflatedCopy(buffer,log));
+    if(!wb.worksheets.length) throw new Error("工作簿没有工作表");
+    // ExcelJS loses localSheetId for this Excel-owned name and spliceRows fragments it.
+    // Keep worksheet.autoFilter, which is the authoritative filter range. A global reserved
+    // _FilterDatabase name makes desktop Excel reject the entire otherwise readable file.
+    wb.definedNames.model=wb.definedNames.model.filter(n=>n.name!=="_xlnm._FilterDatabase");
+    return wb;
+  }
+  async function preprocessBuffer(buffer, filename="表1.xlsx") {
+    const log=report(filename), wb=await load(buffer,log);
+    const meta=preprocess(wb.worksheets[0],log);
+    return {buffer:await wb.xlsx.writeBuffer(),...meta,report:log,actions:log.issues.map(i=>i.message)};
+  }
+  async function processBuffer(buffer, filename="表1.xlsx", plus=1, preserveWidths=true) {
+    const log=report(filename);
+    try {
+      const wb=await load(buffer,log), ws=wb.worksheets[0];
+      const meta=preprocess(ws,log);
+      autoWidth(ws,meta.header,meta.cols,log,preserveWidths);
+      const needed=autoHeight(ws,meta.cols,log,plus);
+      const inserted=splitOverflow(ws,needed,log);
+      if(wb.worksheets.length>1) add(log,"OTHER_SHEETS","仅处理第一张工作表，其余工作表保留","","info");
+      setupSourcePrint(ws,meta.header,meta.cols,log);
+      const out=await wb.xlsx.writeBuffer(); log.stages.push("output");
+      return {buffer:out,report:log,inserted,adjusted:needed.size,filename:outputName(filename,meta.title),...meta};
+    } catch(e) {
+      add(log,/merge|合并/i.test(e.message)?"MERGE_INVALID":"OUTPUT_FAILED",`处理/输出失败：${e.message}`,"","error");
+      e.report=log; throw e;
+    }
+  }
+  // Backups are keyed by original filename, deliberately not by the changed content hash.
+  const memoryBackups=new Map(), work=new Map();
+  let dbPromise;
+  function openBackups() {
+    if(!dbPromise) dbPromise=new Promise((resolve,reject)=> {
+      if(typeof indexedDB==="undefined") {reject(new Error("浏览器不支持持久备份"));return;}
+      const request=indexedDB.open("weekly-plan-source-backups-v1",1);
+      request.onupgradeneeded=()=>request.result.createObjectStore("originals");
+      request.onsuccess=()=>resolve(request.result);
+      request.onerror=()=>reject(request.error);
+    });
+    return dbPromise;
+  }
+  async function backupOnce(filename, bytes, log) {
+    try {
+      const db=await openBackups();
+      await new Promise((resolve,reject)=> {
+        const tx=db.transaction("originals","readwrite"), store=tx.objectStore("originals"), get=store.get(filename);
+        get.onsuccess=()=>{if(get.result===undefined) store.add(bytes.slice(0),filename);else add(log,"BACKUP_EXISTS","备份已存在，跳过且不覆盖","","info");};
+        tx.oncomplete=resolve; tx.onerror=()=>reject(tx.error); tx.onabort=()=>reject(tx.error||new Error("备份中断"));
+      });
+    } catch(e) {
+      if(!memoryBackups.has(filename)) memoryBackups.set(filename,bytes.slice(0));
+      add(log,"BACKUP_MEMORY_ONLY","浏览器持久备份不可用，仅保留本次会话备份；请下载源文件备份ZIP。"+e.message);
+    }
+  }
+  async function getBackup(filename) {
+    try {
+      const db=await openBackups();
+      const value=await new Promise((resolve,reject)=> {
+        const req=db.transaction("originals").objectStore("originals").get(filename);
+        req.onsuccess=()=>resolve(req.result); req.onerror=()=>reject(req.error);
+      });
+      if(value!==undefined) return value;
+    } catch { /* fallback to this session's explicitly reported in-memory backup */ }
+    const value=memoryBackups.get(filename);
+    if(value===undefined) throw new Error("未找到源文件备份，请重新导入源文件");
+    return value;
+  }
+  async function processFile(file, plus=1, preserveWidths=true) {
+    if(!isSource(file.name)) throw new Error("请导入原始.xlsx源表；已排除临时文件、明细、处理后源表和work目录");
+    const bytes=await file.arrayBuffer(), log=report(file.name);
+    await backupOnce(file.name,bytes,log); log.stages.push("backup_work");
+    const token=Symbol(file.name); work.set(token,bytes.slice(0));
+    let out;
+    try {
+      out=await processBuffer(work.get(token),file.name,plus,preserveWidths);
+      out.report.issues.unshift(...log.issues); out.report.stages.unshift(...log.stages);
+      return out;
+    } catch(e) {
+      if(e.report) {e.report.issues.unshift(...log.issues);e.report.stages.unshift(...log.stages);e.report.stages.push("work_cleanup");}
+      throw e;
+    } finally { work.delete(token); if(out) out.report.stages.push("work_cleanup"); }
+  }
+  // Minimal ZIP STORE writer: backup bytes are copied verbatim under 源文件备份/.
+  async function backupZip(filename) {
+    const bytes=new Uint8Array(await getBackup(filename)), name=new TextEncoder().encode("源文件备份/"+filename);
+    let crc=0xffffffff;
+    for(const b of bytes) {crc^=b;for(let i=0;i<8;i++) crc=(crc>>>1)^((crc&1)?0xedb88320:0);}
+    crc=(crc^0xffffffff)>>>0;
+    const result=new Uint8Array(30+name.length+bytes.length+46+name.length+22), v=new DataView(result.buffer);
+    const u16=(p,n)=>v.setUint16(p,n,true), u32=(p,n)=>v.setUint32(p,n,true);
+    u32(0,0x04034b50);u16(4,20);u16(6,0x800);u16(12,33);u32(14,crc);u32(18,bytes.length);u32(22,bytes.length);u16(26,name.length);
+    result.set(name,30);result.set(bytes,30+name.length);
+    const p=30+name.length+bytes.length;
+    u32(p,0x02014b50);u16(p+4,20);u16(p+6,20);u16(p+8,0x800);u16(p+14,33);u32(p+16,crc);u32(p+20,bytes.length);u32(p+24,bytes.length);u16(p+28,name.length);result.set(name,p+46);
+    const e=p+46+name.length;
+    u32(e,0x06054b50);u16(e+8,1);u16(e+10,1);u32(e+12,46+name.length);u32(e+16,p);
+    return result;
+  }
+  return {processBuffer,processFile,preprocessBuffer,outputName,isSource,backupZip,getBackup,backupOnce,
+    work,report,preprocess,autoWidth,autoHeight,splitOverflow,validateTime,width,columnMap};
+}
+if (typeof module !== "undefined" && module.exports) module.exports = {createSourceProcessor};
+
+  const sourceProcessor = createSourceProcessor(import_exceljs.default);
+  async function preprocessSourceBuffer(buffer, filename) {
+    return sourceProcessor.preprocessBuffer(buffer, filename);
+  }
+  async function writeProcessedSourceXlsx(buffer, parsed, measuresPlus = 1) {
+    return sourceProcessor.processBuffer(buffer, parsed?.sourceName || "表1.xlsx", measuresPlus);
+  }
+// END SOURCE PROCESSOR
 
   function mergeDateColumns(ws, layout) {
     let i = 0;
@@ -25744,9 +26045,13 @@ var WeeklyPlan = (() => {
 </script>
     <script>
       const WP = window.WeeklyPlan;
-      const plus = 0;
+      let plus = 1;
       let result = WP.runSamplePipeline(plus);
-      let processedBuffer = null;
+      let sourceFile = null;
+      let sourceOutput = null;
+      let sourceReport = null;
+      let importing = false;
+      let importVersion = 0;
       let panel = "sheet";
       const $ = (id) => document.getElementById(id);
       function toast(msg) {
@@ -25777,35 +26082,57 @@ var WeeklyPlan = (() => {
         });
         render();
       }
+      function renderSourceStatus() {
+        const issues = sourceReport?.issues || [];
+        const errors = issues.filter(i => i.level === "error").length;
+        const warnings = issues.filter(i => i.level === "warn").length;
+        $("sourceStatus").textContent = importing ? "正在备份并处理源表…" : sourceOutput
+          ? `源表已整理：删除${sourceOutput.deletedRows}行，插入${sourceOutput.inserted}行；${errors}项错误，${warnings}项警告。请在处理日志核对。`
+          : sourceReport ? "源表未能导出，请查看处理日志或下载报告。" : "尚未导入源表";
+        for (const id of ["btnProcessedSrc", "btnHeaderProcessedSrc"]) $(id).disabled = importing || !sourceOutput;
+        $("btnBackup").disabled = importing || !sourceFile;
+        $("btnSourceReport").disabled = importing || !sourceReport;
+        $("measuresPlus").disabled = importing;
+        $("preserveWidths").disabled = importing;
+      }
       async function onFile(file) {
-        if (!file || !/\.xlsx$/i.test(file.name) || file.name.startsWith("~$")) {
-          toast("请上传 .xlsx 源表（表1）");
-          return;
+        if (!file || !WP.sourceProcessor.isSource(file.name)) {
+          toast("请导入原始.xlsx；已排除临时文件、明细和处理后源表"); return;
         }
+        const version = ++importVersion;
+        importing = true; sourceFile = file; sourceOutput = null; sourceReport = null;
+        renderSourceStatus();
         try {
-          const rawBuffer = await file.arrayBuffer();
-          const cleaned = await WP.preprocessSourceBuffer(rawBuffer);
-          processedBuffer = cleaned.buffer;
-          const preLogs = cleaned.actions.map((a) => ({ level: "info", message: a }));
-          if (cleaned.deletedRows > 0) {
-            preLogs.push({ level: "info", message: "已删除含\u201C例\u201D的行 " + cleaned.deletedRows + " 行" });
+          const out = await WP.sourceProcessor.processFile(file, plus, $("preserveWidths").checked);
+          if (version !== importVersion) return;
+          sourceOutput = out; sourceReport = out.report;
+          // Detail parsing uses the cleaned, unsplit rows. It never gates source export.
+          try {
+            const cleaned = await WP.preprocessSourceBuffer(await file.arrayBuffer(), file.name);
+            const parsed = await WP.parseSourceWorkbook(cleaned.buffer, file.name);
+            if (version !== importVersion) return;
+            const errors = sourceReport.issues.some(i => i.level === "error");
+            if (errors) throw new Error("源表含日期、时间或必需列错误，请修正后重新导入以生成明细。");
+            result = WP.runPipeline({title: parsed.title, headers: parsed.headers, rows: parsed.rows,
+              sourceName: file.name, measuresPlus: plus, extraLogs: parsed.logs});
+          } catch (e) {
+            if (version !== importVersion) return;
+            result = null;
+            sourceReport.issues.push({level:"warn",code:"DETAIL_UNAVAILABLE",source:file.name,cell:"",message:"明细未生成：" + e.message});
           }
-          const parsed = await WP.parseSourceWorkbook(processedBuffer, file.name);
-          result = WP.runPipeline({
-            title: parsed.title,
-            headers: parsed.headers,
-            rows: parsed.rows,
-            sourceName: file.name,
-            measuresPlus: plus,
-            extraLogs: [...preLogs, ...parsed.logs],
-          });
-          toast("已处理 " + file.name);
-          render();
+          panel = "log";
+          toast("源表已整理，可下载处理结果和报告");
         } catch (e) {
-          toast(e.message || "解析失败");
+          if (version !== importVersion) return;
+          result = null;
+          sourceReport = e.report || {source:file.name,issues:[{level:"error",code:"OUTPUT_FAILED",message:e.message}],stages:[]};
+          panel = "log"; toast(e.message || "源表处理失败");
+        } finally {
+          if (version === importVersion) { importing = false; render(); renderSourceStatus(); }
         }
       }
       async function downloadExcel() {
+        if (!result) { toast("请先修正源表报告中的数据错误"); return; }
         const buf = await WP.writeWeeklyPlanXlsx(result.layout);
         const weekMatch = result.sourceName.match(/（第[0-9一二三四五六七八九十百千]+周）/);
         const name = (weekMatch ? weekMatch[0] : result.sourceName.replace(/\.xlsx$/i, "")) + "（周计划明细）.xlsx";
@@ -25813,14 +26140,14 @@ var WeeklyPlan = (() => {
         toast("明细表已下载");
       }
       async function downloadProcessedSource() {
-        if (!processedBuffer || !result) {
-          toast("请先载入源表（表1）");
-          return;
+        if (!sourceOutput) { toast("请先导入源表"); return; }
+        try {
+          downloadBlob(new Blob([sourceOutput.buffer], {type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}), sourceOutput.filename);
+          toast("已下载：" + sourceOutput.filename);
+        } catch(e) {
+          sourceReport.issues.push({level:"error",code:"OUTPUT_FAILED",message:"下载失败：" + e.message});
+          panel="log"; render(); renderSourceStatus();
         }
-        const out = await WP.writeProcessedSourceXlsx(processedBuffer, result, plus);
-        const name = result.sourceName; // 处理后源表沿用原文件名（不追加"（处理后的源表）"）
-        downloadBlob(new Blob([out.buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), name);
-        toast("处理后的源表已下载（调整 " + out.adjusted + " 行，插行 " + out.inserted + " 行）");
       }
       function renderSheet() {
         const layout = result.layout;
@@ -25860,7 +26187,7 @@ var WeeklyPlan = (() => {
         return `<div class="sheet">
           <div class="sheet-head">
             <div><div class="tiny" style="opacity:.7">A3 LANDSCAPE</div><b>${escapeHtml(title?.cells[0]?.value || layout.title)}</b></div>
-            <div class="tiny">管控措施按内容自动插行</div>
+            <div class="tiny">周计划明细不含管控措施</div>
           </div>
           <table><thead><tr><th>行高</th><th>日期</th><th>B</th><th>C</th><th>D</th><th>E</th><th>F</th><th>G</th><th>H</th></tr></thead><tbody>${body}</tbody></table>
         </div>`;
@@ -25877,20 +26204,43 @@ var WeeklyPlan = (() => {
         return `<div class="sheet"><table><thead><tr><th>行</th><th>类型</th><th>估算</th><th>增量</th><th>写入</th></tr></thead><tbody>${tr}</tbody></table></div>`;
       }
       function render() {
-        $("srcName").textContent = "当前：" + result.sourceName;
+        $("srcName").textContent = "当前：" + (sourceFile?.name || result?.sourceName || "未载入");
+        for (const id of ["btnExcel", "btnExcel2", "btnRisk", "btnSum"]) $(id).disabled = importing || !result;
+        document.querySelectorAll(".tabs button").forEach(b => b.classList.toggle("on", b.dataset.panel === panel));
+        const allLogs = [...(sourceReport?.issues || []).map(i => ({...i, message: [i.code, i.cell, i.message].filter(Boolean).join(" · ")})), ...(result?.logs || [])];
+        if (!result) {
+          $("sumPreview").textContent = "源表整理和下载可独立使用；明细需先修正数据错误。";
+          $("stats").textContent = "明细尚未生成";
+          $("panel").innerHTML = `<ul class="log">${allLogs.map(l => `<li><span class="dot ${l.level}"></span><span>${escapeHtml(l.message)}</span></li>`).join("")}</ul>`;
+          renderSourceStatus(); return;
+        }
         $("sumPreview").textContent = result.summaryTxt.slice(0, 180);
         const s = result.stats;
         $("stats").innerHTML = `<p class="tiny">STATS</p><h2>统计</h2>
           <div class="stat"><span>有效记录</span><b>${s.totalRecords}</b></div>
           <div class="stat"><span>日计划项</span><b>${s.totalDailyItems}</b></div>
           <div class="stat"><span>低压计量（明细已滤）</span><b>${s.skippedLowVoltage}</b></div>
-          <div class="stat"><span>管控措施按内容插行</span><b>自动</b></div>`;
+          <div class="stat"><span>管控措施</span><b>仅源表保留</b></div>`;
         if (panel === "sheet") $("panel").innerHTML = renderSheet();
         else if (panel === "height") $("panel").innerHTML = renderHeight();
         else if (panel === "risk") $("panel").innerHTML = `<div class="pre">${escapeHtml(result.riskTxt)}</div>`;
-        else $("panel").innerHTML = `<ul class="log">${result.logs.map((l) => `<li><span class="dot ${l.level}"></span><span>${escapeHtml(l.message)}</span></li>`).join("")}</ul>`;
+        else $("panel").innerHTML = `<ul class="log">${allLogs.map((l) => `<li><span class="dot ${l.level}"></span><span>${escapeHtml(l.message)}</span></li>`).join("")}</ul>`;
       }
-      $("btnSample").onclick = () => { result = WP.runSamplePipeline(plus); toast("已恢复示例周"); render(); };
+      $("btnSample").onclick = () => { ++importVersion; importing=false; sourceFile=null; sourceOutput=null; sourceReport=null; result=WP.runSamplePipeline(plus); panel="sheet"; render(); renderSourceStatus(); toast("已恢复示例周"); };
+      $("measuresPlus").onchange = async e => {
+        const value = Number(e.target.value);
+        if (!Number.isFinite(value) || value < 0 || value > 20) { e.target.value = plus; toast("请输入0至20之间的增量"); return; }
+        plus = value;
+        if (sourceFile) await onFile(sourceFile); else { result = WP.runSamplePipeline(plus); render(); }
+      };
+      $("preserveWidths").onchange = async () => { if (sourceFile) await onFile(sourceFile); };
+      $("btnBackup").onclick = async () => {
+        try { if (sourceFile) downloadBlob(new Blob([await WP.sourceProcessor.backupZip(sourceFile.name)], {type:"application/zip"}), "源文件备份.zip"); }
+        catch(e) { toast("备份下载失败：" + e.message); }
+      };
+      $("btnSourceReport").onclick = () => {
+        if(sourceReport) downloadBlob(new Blob([JSON.stringify(sourceReport,null,2)], {type:"application/json;charset=utf-8"}), (sourceOutput?.filename || sourceFile.name) + ".报告.json");
+      };
       $("btnExcel").onclick = downloadExcel;
       $("btnHeaderProcessedSrc").onclick = downloadProcessedSource;
       $("btnExcel2").onclick = downloadExcel;
@@ -25915,6 +26265,7 @@ var WeeklyPlan = (() => {
         };
       });
       render();
+      renderSourceStatus();
     </script>
   </body>
 </html>

@@ -6,3 +6,7 @@ __pycache__/
 周计划项目汇总.txt
 周计划导出错误日志.txt
 .DS_Store
+work/
+源文件备份/
+*（处理后的源表）.xlsx
+*.报告.json

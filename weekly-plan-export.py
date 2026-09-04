@@ -201,16 +201,9 @@ def format_job_content(content):
     parts = re.split(r'[;；]', content)
     return [part.strip() for part in parts if part.strip()]
 def find_excel_files():
-    files = [
-        f for f in glob.glob("*表1*.xlsx")
-        if os.path.isfile(f)
-        and not f.startswith('~$')
-        and "（周计划明细）" not in f
-        and "(周计划明细)" not in f
-        and "（处理后的源表）" not in f
-        and "(处理后的源表)" not in f
-    ]
-    return files
+    from source_processor import scan_sources
+    return [str(p) for p in scan_sources('.')]
+
 PROF_ORDER = [
     ("变电", ["变电"]),
     ("输电", ["输电"]),
@@ -311,6 +304,7 @@ def load_source_df(src):
     data = [tuple(cell.value for cell in row) for row in ws.iter_rows(min_row=3)]
     df = pd.DataFrame(data, columns=headers)
     df = df.dropna(how='all').reset_index(drop=True)
+    wb.close()
     return df, title
 def resolve_columns(df):
     cols = df.columns.tolist()
@@ -373,7 +367,7 @@ def build_standard_records(df, cols):
         p_rank = get_prof_priority(spec_raw)
         is_low_voltage = "低压计量" in content_raw or "低压计量" in project_display
         dedup_key = (content_norm, time_canon, project_norm, spec_norm,
-                     risk_norm, person_norm, power_norm, measures_norm)
+                     risk_norm, person_norm, power_norm)
         if dedup_key in seen:
             continue
         seen.add(dedup_key)
@@ -520,76 +514,38 @@ def fix_missing_time_dash(ws, max_row):
     if changed > 0:
         safe_print(f"  ⏰ 时间补齐：修正了 {changed} 个时间单元格遗漏的\"-\"分隔符")
     return changed
+_working_contexts = {}
+
 def preprocess_source_file(src):
-    """
-    源表基础预处理：
-    保持数据拓扑单行结构，供 DataFrame 安全读取，绝不提前拆行。
-    """
-    import shutil
-    global _processed_source_cache
-    if src in _processed_source_cache:
-        return src
-    safe_print(f"  🔍 源表预处理开始: {os.path.basename(src)}")
-    backup_dir = "源文件备份"
-    if not os.path.exists(backup_dir):
-        os.makedirs(backup_dir)
-    backup_path = os.path.join(backup_dir, os.path.basename(src))
+    from source_processor import working_copy, preprocess_sheet, Report, trim_inflated_copy
+    context = working_copy(src)
+    path = context.__enter__()
+    _working_contexts[str(path)] = context
+    wb = None
     try:
-        shutil.copy2(src, backup_path)
-    except Exception as e:
-        safe_print(f"  ⚠️  备份失败: {e}，继续处理")
-    try:
-        wb = load_workbook(src)
-        ws = wb.active
-    except Exception as e:
-        safe_print(f"  ⚠️  预处理跳过：无法加载文件 {e}")
-        return src
-    example_row = None
-    filler_row = None
-    scan_range = min(20, ws.max_row)
-    for r in range(1, scan_range + 1):
-        a_val = ws.cell(r, 1).value
-        b_val = ws.cell(r, 2).value
-        is_example = False
-        if a_val and isinstance(a_val, str) and len(a_val) <= 5 and ("例" in a_val or "示例" in a_val):
-            is_example = True
-        if _has_strikethrough(ws.cell(r, 1)):
-            is_example = True
-        if is_example and example_row is None:
-            example_row = r
-        if b_val:
-            b_clean = str(b_val).strip()
-            if b_clean in ("填报人及联系方式", "填报人"):
-                filler_row = r
-    if example_row is not None or filler_row is not None:
-        rows_to_delete = sorted(set(r for r in [example_row, filler_row] if r is not None), reverse=True)
-        for r in rows_to_delete:
-            try:
-                ws.delete_rows(r)
-            except Exception as e:
-                safe_print(f"  ⚠️  删除第{r}行失败: {e}")
-    format_max_col = min(ws.max_column, 25)
-    normalize_cell_line_breaks(ws, ws.max_row, format_max_col)
-    merge_name_phone(ws, ws.max_row, format_max_col)
-    fix_missing_time_dash(ws, ws.max_row)
-    try:
-        wb.save(src)
-        wb.close()
-        safe_print(f"  ✅ 预处理完成并已保存：{os.path.basename(src)}")
-    except Exception as e:
-        safe_print(f"  ❌ 保存源文件失败: {e}")
-        try:
+        report = Report(src)
+        trim_inflated_copy(path, report)
+        wb = load_workbook(path)
+        preprocess_sheet(wb.worksheets[0], report)
+        wb.save(path)
+        for issue in report.issues:
+            if issue['level'] in ('warn', 'error'):
+                log_error(src, issue['code'], issue['cell'] + ' ' + issue['message'])
+        if any(issue['level'] == 'error' for issue in report.issues):
+            raise ValueError('源表存在日期、时间或必需列错误，请先修正报告中的问题再生成明细')
+        return str(path)
+    except Exception:
+        cleanup_preprocessed_file(str(path))
+        raise
+    finally:
+        if wb:
             wb.close()
-        except Exception:
-            pass
-        return src
-    _processed_source_cache.add(src)
-    return src
+
 def cleanup_preprocessed_file(path):
-    pass
-# ============================================================
-# ★ 核心修正：管控措施超长全列贯穿插行平摊（稳定版）
-# ============================================================
+    context = _working_contexts.pop(str(path), None)
+    if context:
+        context.__exit__(None, None, None)
+
 def _get_row_height(ws, row, default=15.0):
     h = ws.row_dimensions[row].height
     if h is None or h <= 0:
@@ -616,162 +572,16 @@ def _estimate_needed_height(cell, col_width_chars):
         h += MEASURES_HEIGHT_PLUS
     return h
 def insert_overflow_rows_by_measures(ws, start_row=3):
-    """
-    针对源表【管控措施】列超长进行整行全列贯穿式插行与高度平摊。
-    彻底解决 openpyxl insert_rows 引发的合并单元格错位与只读异常。
-    """
-    max_col = ws.max_column
-    # 1. 动态定位管控措施列
-    measures_col = None
-    for kw in (("管控措施", "防范措施"), ("措施", "关键风险")):
-        for c in range(1, max_col + 1):
-            for r in (2, 3):
-                val = str(ws.cell(r, c).value or "").strip()
-                if val and len(val) <= 20 and any(k in val for k in kw):
-                    measures_col = c
-                    break
-            if measures_col:
-                break
-        if measures_col:
-            break
-    if not measures_col:
-        safe_print("  ⚠️ 未找到【管控措施】列，跳过插行处理")
-        return 0
-    col_letter = get_column_letter(measures_col)
-    col_width = ws.column_dimensions[col_letter].width or 30.0
-    est_width = max(25.0, min(col_width, 60.0))
-    total_inserted = 0
-    row = start_row
-    while row <= ws.max_row:
-        # 跳过从属于已有合并区域的非首行
-        is_sub_merged = any(
-            rng.min_row < row <= rng.max_row and rng.min_col <= measures_col <= rng.max_col
-            for rng in ws.merged_cells.ranges
-        )
-        if is_sub_merged:
-            row += 1
-            continue
-        cell_val = ws.cell(row, measures_col).value
-        text = str(cell_val or "").strip()
-        needed_height = _estimate_text_height(text, est_width)
-        # 超过单行高度上限 409.5 磅，触发全列贯穿插行
-        if needed_height > EXCEL_MAX_ROW_HEIGHT:
-            rows_needed = math.ceil(needed_height / EXCEL_MAX_ROW_HEIGHT)
-            rows_to_insert = rows_needed - 1
-            insert_at = row + 1
-            end_insert_row = row + rows_to_insert
-            # 2. 识别当前行覆盖的列分区（完整保护原有横向合并块）
-            col_visited = set()
-            merges_to_extend = []
-            single_cols = []
-            for c in range(1, max_col + 1):
-                if c in col_visited:
-                    continue
-                matched_rng = None
-                for rng in list(ws.merged_cells.ranges):
-                    if rng.min_row <= row <= rng.max_row and rng.min_col <= c <= rng.max_col:
-                        matched_rng = rng
-                        break
-                if matched_rng:
-                    for sub_c in range(matched_rng.min_col, matched_rng.max_col + 1):
-                        col_visited.add(sub_c)
-                    merges_to_extend.append((matched_rng.min_row, matched_rng.min_col,
-                                            matched_rng.max_row, matched_rng.max_col))
-                else:
-                    col_visited.add(c)
-                    single_cols.append(c)
-            # 3. 记录插行前的全部合并区，并全部解除
-            #    （openpyxl 的 insert_rows 不会自动移动下方合并区坐标，必须统一重排，否则错位）
-            all_merges = [(r.min_row, r.min_col, r.max_row, r.max_col)
-                          for r in list(ws.merged_cells.ranges)]
-            for (a, b, c2, d) in all_merges:
-                try:
-                    ws.unmerge_cells(start_row=a, start_column=b, end_row=c2, end_column=d)
-                except Exception:
-                    pass
-            # 4. 执行物理插行
-            ws.insert_rows(insert_at, amount=rows_to_insert)
-            # 5. 按插行偏移重建全部合并：当前行块向下延伸，下方块整体下移，上方块不变
-            for (min_r, min_c, max_r, max_c) in all_merges:
-                if min_r <= row <= max_r:
-                    # 当前行块：原 slave 随插行下移 rows_to_insert，末行取 max(max_r+rows_to_insert, end_insert_row)
-                    ws.merge_cells(start_row=min_r, start_column=min_c,
-                                   end_row=max(max_r + rows_to_insert, end_insert_row), end_column=max_c)
-                elif min_r > row:
-                    ws.merge_cells(start_row=min_r + rows_to_insert, start_column=min_c,
-                                   end_row=max_r + rows_to_insert, end_column=max_c)
-                else:
-                    ws.merge_cells(start_row=min_r, start_column=min_c,
-                                   end_row=max_r, end_column=max_c)
-            # 6. 独立单格执行纵向向下合并
-            for c in single_cols:
-                ws.merge_cells(start_row=row, start_column=c,
-                               end_row=end_insert_row, end_column=c)
-            # 6.5 管控措施列合并区强制居左（内容对齐打印）
-            try:
-                ws.cell(row, measures_col).alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
-            except Exception:
-                pass
-            # 6. 复制格式及边框到新插入行，防止打印断线
-            for c in range(1, max_col + 1):
-                src_cell = ws.cell(row, c)
-                for r_new in range(insert_at, end_insert_row + 1):
-                    dst_cell = ws.cell(r_new, c)
-                    if src_cell.has_style:
-                        dst_cell.font = src_cell.font.copy()
-                        dst_cell.border = src_cell.border.copy()
-                        dst_cell.fill = src_cell.fill.copy()
-                        dst_cell.alignment = src_cell.alignment.copy()
-            # 7. 行高均匀分摊
-            avg_height = round(needed_height / rows_needed, 1)
-            for r_sub in range(row, end_insert_row + 1):
-                ws.row_dimensions[r_sub].height = avg_height
-                try:
-                    ws.row_dimensions[r_sub].customHeight = True
-                except Exception:
-                    pass
-            safe_print(f"  📏 第{row}行【管控措施】超长({needed_height:.0f}磅)，已插入{rows_to_insert}行续行，全列全量贯穿合并，每行分摊{avg_height}磅")
-            total_inserted += rows_to_insert
-            row = end_insert_row + 1
-        else:
-            cur_h = ws.row_dimensions[row].height or 15.0
-            target = max(needed_height, cur_h) + MEASURES_SRC_HEIGHT_PLUS
-            if target <= EXCEL_MAX_ROW_HEIGHT and target > 15.0:
-                ws.row_dimensions[row].height = round(target, 1)
-                try:
-                    ws.row_dimensions[row].customHeight = True
-                except Exception:
-                    pass
-            row += 1
-    return total_inserted
+    from source_processor import column_map, format_sheet, Report
+    header, cols = column_map(ws)
+    return format_sheet(ws, header, cols, Report(), MEASURES_HEIGHT_PLUS)
+
 def export_processed_source(cleaned_src_path, original_src):
-    """从清洗好的源表导出带全列插行的《处理后的源表》"""
-    try:
-        wb = load_workbook(cleaned_src_path)
-    except Exception as e:
-        safe_print(f"  ⚠️  加载源表插行失败: {e}")
-        return None
-    ws = wb.active
-    inserted = insert_overflow_rows_by_measures(ws, start_row=3)
-    m = re.search(r'第\s*(\d+)\s*周', os.path.basename(original_src))
-    if m:
-        out_name = f"（第{m.group(1)}周）（处理后的源表）.xlsx"
-    else:
-        base = os.path.splitext(os.path.basename(original_src))[0]
-        out_name = f"{base}（处理后的源表）.xlsx"
-    out_path = os.path.join(os.path.dirname(original_src) or '.', out_name)
-    try:
-        wb.save(out_path)
-        wb.close()
-        safe_print(f"  📄 处理后的源表已生成（管控措施列插行 {inserted} 行）：{out_name}")
-        return out_path
-    except Exception as e:
-        safe_print(f"  ❌ 保存处理后的源表失败: {e}")
-        try:
-            wb.close()
-        except Exception:
-            pass
-        return None
+    from source_processor import process_file
+    # The processor creates its own protected work copy, including when called directly.
+    target, _ = process_file(original_src, MEASURES_HEIGHT_PLUS)
+    return str(target)
+
 # ======================================
 # 周计划明细插行与分页排版
 # ======================================
@@ -951,8 +761,9 @@ def generate_weekly_plan_v5(all_files):
         safe_print("⚠️ 没有找到可处理的文件")
         return
     for src in all_files:
-        processed_src = preprocess_source_file(src)
+        processed_src = None
         try:
+            processed_src = preprocess_source_file(src)
             safe_print(f"\n📁 读取文件: {src}")
             df, title = load_source_df(processed_src)
             if df.empty:
@@ -983,8 +794,6 @@ def generate_weekly_plan_v5(all_files):
                     f"作业风险等级：{rec['risk_raw']}",
                     f"作业时间：{rec['start_time']}-{rec['end_time']}"
                 ]
-                if rec.get('measures_raw'):
-                    job_desc_parts.append(f"管控措施：{rec['measures_raw']}")
                 if rec['has_power_plan']:
                     job_desc_parts.append("【关联月度停电计划】")
                 job_desc = "\n".join(job_desc_parts)
@@ -993,7 +802,7 @@ def generate_weekly_plan_v5(all_files):
                     "job_desc": job_desc,
                     "spec": rec['spec_raw'],
                     "risk_val": rec['risk_raw'],
-                    "has_measures": bool(rec.get('measures_raw')),
+                    "has_measures": False,
                     "l_rank": rec['l_rank'],
                     "p_rank": rec['p_rank'],
                 })
@@ -1003,6 +812,9 @@ def generate_weekly_plan_v5(all_files):
         except Exception as e:
             log_error(src, "周计划明细生成失败(V5)", str(e), traceback.format_exc())
             safe_print(f"❌ 文件处理失败: {src} | {e}", error=True)
+        finally:
+            cleanup_preprocessed_file(processed_src)
+
 def generate_excel_output_v5(daily_data, start_date, end_date, src):
     PLANS_PER_GROUP = 7
     wb_out = Workbook()
@@ -1125,8 +937,9 @@ def generate_risk_txt(all_files):
         return
     risk_data = {"三级": [], "四级": [], "五级": []}
     for src in all_files:
-        processed_src = preprocess_source_file(src)
+        processed_src = None
         try:
+            processed_src = preprocess_source_file(src)
             df, _ = load_source_df(processed_src)
             if df.empty:
                 continue
@@ -1140,6 +953,8 @@ def generate_risk_txt(all_files):
                 risk_data[risk_level].append((rec['date'], rec['full_content']))
         except Exception as e:
             log_error(src, "三四五级TXT生成失败", str(e), traceback.format_exc())
+        finally:
+            cleanup_preprocessed_file(processed_src)
     lines = []
     for level in ["三级", "四级", "五级"]:
         lines.append(f"{level}作业风险管控情况\n")
@@ -1171,8 +986,9 @@ def generate_summary_txt(all_files):
     yx_high_count = 0
     yx_low_count = 0
     for src in all_files:
-        processed_src = preprocess_source_file(src)
+        processed_src = None
         try:
+            processed_src = preprocess_source_file(src)
             df, _ = load_source_df(processed_src)
             if df.empty:
                 continue
@@ -1195,6 +1011,8 @@ def generate_summary_txt(all_files):
                         yx_low_count += 1
         except Exception as e:
             log_error(src, "汇总统计生成失败", str(e), traceback.format_exc())
+        finally:
+            cleanup_preprocessed_file(processed_src)
     std_prof_names = [name for name, _ in PROF_ORDER]
     spec_parts = []
     for prof_name in std_prof_names:
@@ -1235,8 +1053,13 @@ def generate_processed_source_files(all_files):
         safe_print("⚠️ 没有找到可处理的源文件")
         return
     for src in all_files:
-        cleaned_src = preprocess_source_file(src)
-        export_processed_source(cleaned_src, src)
+        try:
+            path = export_processed_source(None, src)
+            safe_print(f"已生成：{path}")
+        except Exception as exc:
+            log_error(src, "OUTPUT_FAILED", str(exc))
+            safe_print(f"处理失败：{src} | {exc}", error=True)
+
 def cleanup_error_log():
     if _error_count == 0 and os.path.exists(ERROR_LOG_PATH):
         try:
