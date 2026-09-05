@@ -17,7 +17,8 @@ payload = base64.b64encode(gzip.compress(json.dumps(files,ensure_ascii=False).en
 # Its output/backup directory is stable and independent of this app folder.
 def standalone(html):
     packed = base64.b64encode(gzip.compress(json.dumps({**files,'日计划工作台.html':html},ensure_ascii=False).encode(),mtime=0)).decode()
-    return '''# -*- coding: utf-8 -*-
+    return '''#! python3
+# -*- coding: utf-8 -*-
 """日计划工作台：双击启动；已内嵌原版 Python 与网页，不修改原表。"""
 import base64, gzip, json, os, pathlib, subprocess, sys, tempfile
 DATA = "'''+packed+'''"
