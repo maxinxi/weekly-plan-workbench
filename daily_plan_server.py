@@ -304,23 +304,33 @@ def match_records(site, risk):
 
 def audit(documents):
     issues = []
-    def issue(code,message,kind='',row=None,field='',value='',suggestion=None):
-        item = dict(code=code,message=message,kind=kind,row=row,field=field,value=value,suggestion=suggestion)
+    def issue(code,message,kind='',row=None,field='',value='',suggestion=None,certainty='certain',comparison=None,choices=None,cause=''):
+        item = dict(code=code,message=message,kind=kind,row=row,field=field,value=value,suggestion=suggestion,
+                    certainty=certainty,comparison=comparison or [],choices=choices or [],cause=cause)
         item['id'] = hashlib.sha256(json.dumps(item,ensure_ascii=False,sort_keys=True).encode()).hexdigest()[:18]
         issues.append(item)
     for kind,doc in documents.items():
         title_md = re.search(r'(\d{1,2})月(\d{1,2})日',doc['title'])
         file_md = re.search(r'(\d{1,2})月(\d{1,2})日',doc['name'])
-        if title_md and file_md and title_md.group() != file_md.group():
+        title_file_conflict = bool(title_md and file_md and title_md.group() != file_md.group())
+        if title_file_conflict:
             proposed = doc['title'][:title_md.start()] + file_md.group() + doc['title'][title_md.end():]
-            issue('TITLE_DATE','标题日期与文件名不一致',kind,1,'title',doc['title'],proposed)
+            issue('TITLE_DATE','文件名日期与表内标题日期不一致，无法自动判断哪一个正确',kind,1,'title',doc['title'],proposed,
+                  certainty='uncertain',cause='两个来源互相矛盾；文件名不是权威数据，表内标题也可能填错。',
+                  comparison=[{'label':'文件名','value':doc['name']},{'label':'表内标题','kind':kind,'row':1,'field':'title','value':doc['title']}],
+                  choices=[{'label':'采用文件名日期，修改表内标题','edit':{'kind':kind,'row':1,'field':'title','value':proposed}}])
         try:
             original_check = legacy().evaluate_plan_date_consistency(doc['name'],doc['title'])
-            if original_check['title_status'] not in legacy().PLAN_DATE_ACCEPTED_STATUSES:
+            if not title_file_conflict and original_check['title_status'] not in legacy().PLAN_DATE_ACCEPTED_STATUSES:
                 proposed = legacy().replace_title_plan_date(doc['title'],original_check['suggested_date']) if original_check['needs_title_change'] else None
-                issue('PLAN_DATE',original_check['reason'],kind,1,'title',doc['title'],proposed)
+                choices = ([{'label':'采用程序识别的计划日期修改标题','edit':{'kind':kind,'row':1,'field':'title','value':proposed}}]
+                           if proposed else [])
+                issue('PLAN_DATE',original_check['reason'],kind,1,'title',doc['title'],proposed,certainty='uncertain',
+                      cause='标题、文件名和计划日期规则没有形成唯一结论。',
+                      comparison=[{'label':'文件名','value':doc['name']},{'label':'表内标题','kind':kind,'row':1,'field':'title','value':doc['title']}],choices=choices)
         except (ValueError,TypeError):
-            issue('TITLE_INVALID','标题或文件名中的日期非法',kind,1,'title',doc['title'])
+            issue('TITLE_INVALID','标题或文件名中的日期非法，无法自动判断应修改哪一边',kind,1,'title',doc['title'],certainty='uncertain',
+                  comparison=[{'label':'文件名','value':doc['name']},{'label':'表内标题','kind':kind,'row':1,'field':'title','value':doc['title']}])
         for record in doc['records']:
             dates = []
             for field in ('start','end'):
@@ -328,27 +338,48 @@ def audit(documents):
                 if err:
                     issue('TIME_INVALID',err,kind,record['row'],field,record[field])
                 elif title_md and (dt.month,dt.day) != tuple(map(int,title_md.groups())):
-                    issue('ROW_DATE','作业日期与标题日期不一致，请核实跨日计划',kind,record['row'],field,record[field])
+                    issue('ROW_DATE','作业日期与标题日期不一致，可能是跨日计划，也可能是日期填错',kind,record['row'],field,record[field],certainty='uncertain',
+                          cause='仅凭标题和作业行无法判断应以哪一个日期为准。',
+                          comparison=[{'label':'表内标题','kind':kind,'row':1,'field':'title','value':doc['title']},
+                                      {'label':('开始时间' if field=='start' else '竣工时间'),'kind':kind,'row':record['row'],'field':field,'value':record[field]}])
             if all(dates) and dates[1] <= dates[0]:
-                issue('TIME_ORDER','计划竣工时间不晚于开始时间',kind,record['row'],'end',record['end'])
+                issue('TIME_ORDER','计划竣工时间不晚于开始时间，但无法判断开始或结束哪一个填错',kind,record['row'],'end',record['end'],certainty='uncertain',
+                      comparison=[{'label':'开始时间','kind':kind,'row':record['row'],'field':'start','value':record['start']},
+                                  {'label':'竣工时间','kind':kind,'row':record['row'],'field':'end','value':record['end']}])
             if record.get('needsSelection') and not record.get('same') and record.get('formulaError'):
                 issue('DROPDOWN',record['formulaError'],kind,record['row'],'same',record.get('same',''))
     if 'site' in documents and 'risk' in documents:
         site,risk = documents['site']['records'],documents['risk']['records']
         if len(site) != len(risk):
-            issue('COUNT',f'现场作业 {len(site)} 项，风险管控 {len(risk)} 项；请核对缺项/重复项，程序不代替新增或删除作业')
+            issue('COUNT',f'初步整理后现场作业 {len(site)} 项、风险管控 {len(risk)} 项，无法自动判断哪张表缺项或重复',certainty='uncertain',
+                  cause='数量差只能证明两表不一致，不能证明项目较多或较少的一方正确。',
+                  comparison=[{'label':'现场表有效作业数','value':str(len(site))},{'label':'风险表有效作业数','value':str(len(risk))}])
         pairs,left_only,right_only = match_records(site,risk)
         for a,b,anchor in pairs:
             if canonical(a['work']) != canonical(b['work']):
-                issue('CROSS_WORK',f'锚点“{anchor}”对应到同一作业，但两表工作内容文字不一致（现场第 {a["row"]} 行 / 风险第 {b["row"]} 行）；只告警，不自动改文字','risk',b['row'],'work',b['work'])
+                issue('CROSS_WORK',f'两表可能是同一项作业，但工作内容文字不一致，无法自动判断哪一边正确',
+                      'risk',b['row'],'work',b['work'],certainty='uncertain',
+                      cause=f'匹配依据：{anchor}。负责人和时间能唯一对应，但文字差异仍需人工确认。',
+                      comparison=[{'label':f'现场表第 {a["row"]} 行','kind':'site','row':a['row'],'field':'work','value':a['work']},
+                                  {'label':f'风险表第 {b["row"]} 行','kind':'risk','row':b['row'],'field':'work','value':b['work']}],
+                      choices=[{'label':'采用现场表内容，修改风险表','edit':{'kind':'risk','row':b['row'],'field':'work','value':a['work']}},
+                               {'label':'采用风险表内容，修改现场表','edit':{'kind':'site','row':a['row'],'field':'work','value':b['work']}}])
             for field in ('start','end'):
                 av,_ = parse_time(a[field]); bv,_ = parse_time(b[field])
                 if (av and bv and av != bv) or (not (av and bv) and canonical(a[field]) != canonical(b[field])):
-                    issue('CROSS_TIME',f'锚点“{anchor}”对应的作业时间不一致（现场第 {a["row"]} 行 / 风险第 {b["row"]} 行）；建议值来自现场表', 'risk',b['row'],field,b[field],a[field])
+                    field_label = '开始时间' if field == 'start' else '竣工时间'
+                    issue('CROSS_TIME',f'两表同一作业的{field_label}不一致，无法自动判断哪一边正确',
+                          'risk',b['row'],field,b[field],certainty='uncertain',cause=f'匹配依据：{anchor}。程序只确认两值冲突，不指定正确来源。',
+                          comparison=[{'label':f'现场表第 {a["row"]} 行','kind':'site','row':a['row'],'field':field,'value':a[field]},
+                                      {'label':f'风险表第 {b["row"]} 行','kind':'risk','row':b['row'],'field':field,'value':b[field]}],
+                          choices=[{'label':'采用现场表时间，修改风险表','edit':{'kind':'risk','row':b['row'],'field':field,'value':a[field]}},
+                                   {'label':'采用风险表时间，修改现场表','edit':{'kind':'site','row':a['row'],'field':field,'value':b[field]}}])
         for record in left_only:
-            issue('UNMATCHED','初步整理后，风险表未找到唯一对应作业；顺序不参与核对，请按工作内容、负责人和时间锚点人工核实','site',record['row'],'work',record['work'])
+            issue('UNMATCHED','初步整理后，风险表未找到唯一对应作业；无法判断是风险表缺项，还是现场表多填/写法差异过大','site',record['row'],'work',record['work'],certainty='uncertain',
+                  comparison=[{'label':f'现场表第 {record["row"]} 行','kind':'site','row':record['row'],'field':'work','value':record['work']},{'label':'风险表','value':'未找到唯一对应项'}])
         for record in right_only:
-            issue('UNMATCHED','初步整理后，现场表未找到唯一对应作业；顺序不参与核对，请按工作内容、负责人和时间锚点人工核实','risk',record['row'],'work',record['work'])
+            issue('UNMATCHED','初步整理后，现场表未找到唯一对应作业；无法判断是现场表缺项，还是风险表多填/写法差异过大','risk',record['row'],'work',record['work'],certainty='uncertain',
+                  comparison=[{'label':'现场表','value':'未找到唯一对应项'},{'label':f'风险表第 {record["row"]} 行','kind':'risk','row':record['row'],'field':'work','value':record['work']}])
     return issues
 
 
@@ -408,7 +439,7 @@ def patch_package(data, doc, original):
             if item.filename == sheetpath:
                 xml = content.decode('utf-8')
                 for address,value in updates.items():
-                    pattern = rf'<c\b(?=[^>]*\br="{address}")[^>]*(?:/>|>[\s\S]*?</c>)'
+                    pattern = rf'<c\b(?=[^>]*\br="{address}")[^>]*?(?:/>|>[\s\S]*?</c>)'
                     match = re.search(pattern,xml)
                     attrs = re.match(r'<c\b([^>]*?)(?:/?>)',match[0])[1] if match else f' r="{address}"'
                     attrs = re.sub(r'\s+t="[^"]*"','',attrs).rstrip('/')
@@ -421,7 +452,7 @@ def patch_package(data, doc, original):
                         if not re.search(rowpat,xml):
                             raise ValueError('找不到需修改的原表行 ' + row)
                         def append_cell(m):
-                            cells = re.findall(r'<c\b[^>]*(?:/>|>[\s\S]*?</c>)',m[2]) + [cell]
+                            cells = re.findall(r'<c\b[^>]*?(?:/>|>[\s\S]*?</c>)',m[2]) + [cell]
                             cells.sort(key=lambda x: col_num(re.search(r'\br="([A-Z]+)',x)[1]))
                             return m[1] + ''.join(cells) + m[3]
                         xml = re.sub(rowpat,append_cell,xml,count=1)
@@ -512,6 +543,18 @@ def excel_export(paths, options):
                     wb.Save()
                     cleaned.append({'file':path.name,'rows':empty_rows})
                     mod.log(f'已删除只有序号的空白行：{path.name}，原排版第 {empty_rows} 行；有效作业序号已重新核对，打印区域已收口')
+                if kind == 'daogang':
+                    # Repeated headers must own their bottom edge. The first data row's
+                    # top edge is visible on page one only; Excel does not repeat it.
+                    header = ws.Range(ws.Cells(2,1),ws.Cells(2,19))
+                    mod.set_range_border(header,mod.XL_EDGE_BOTTOM)
+                    # Excel resolves repeated header edges against each page's first
+                    # data row. Mirror the edge there, using the legacy page breaks.
+                    for page_start in mod.get_page_break_rows(ws,mod.get_used_rows(ws)):
+                        page_top = ws.Range(ws.Cells(page_start,1),ws.Cells(page_start,19))
+                        mod.set_range_border(page_top,mod.XL_EDGE_TOP)
+                    wb.Save()
+                    mod.log('已补齐关键字段表头自身的下框线，重复打印到每一页；字段和侧栏结构保持原样')
                 weight = options.get('border','original')
                 color = options.get('borderColor','#000000')
                 if kind != 'site' and (weight != 'original' or color != '#000000'):
@@ -753,6 +796,13 @@ class Session:
                     final_docs = {kind:read_document(path.name,path.read_bytes(),kind) for kind,path in paths.items()}
                     if any(len(final_docs[k]['records']) != len(self.documents[k]['records']) for k in paths):
                         raise RuntimeError('处理前后有效作业数量发生变化，已停止交付，请查看处理报告')
+                    # Guard the critical level field in both outputs after all row/column
+                    # movement, using job order (legacy preserves it), not physical rows.
+                    attendance_doc = read_document(target.name,target.read_bytes(),'site')
+                    expected_levels = [r['sameLevel'] for r in self.documents['site']['records']]
+                    for checked_doc in (final_docs['site'],attendance_doc):
+                        if [r['sameLevel'] for r in checked_doc['records']] != expected_levels:
+                            raise RuntimeError(checked_doc['name'] + '：同进同出人员层级与源表不一致，已停止交付')
                     from openpyxl import load_workbook
                     final_warnings = []
                     import warnings

@@ -31,6 +31,7 @@ async function main(){
     await p.evaluate(items=>{const dt=new DataTransfer();for(const [name,b64] of items){const raw=atob(b64),bytes=Uint8Array.from(raw,c=>c.charCodeAt(0));dt.items.add(new File([bytes],name,{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}));}document.getElementById('dropzone').dispatchEvent(new DragEvent('drop',{bubbles:true,dataTransfer:dt}));},dropped);
     assert.equal(await p.locator('#import').isEnabled(),true);await p.locator('#import').click();
     await p.locator('.job').first().waitFor({timeout:30000});assert.equal(await p.locator('.job').count(),2);
+    assert.match(await p.locator('#nextStep').textContent(),/正式文件尚未生成.*剩余 1 项/s);
     assert.equal(await p.locator('[data-same]').count(),1);assert.match(await p.locator('.job').nth(1).textContent(),/管理人员.*不需要领导选择/s);
     const job=p.locator('.job').first();await job.locator('[data-choice=am]').selectOption('0');await job.locator('[data-choice=pm]').selectOption('1');await job.locator('[data-write]').click();
     await p.locator('#confirmDialog').waitFor({state:'visible'});await p.locator('[data-close=confirmDialog]').click();
@@ -39,7 +40,23 @@ async function main(){
     assert.equal(await p.locator('#textB').inputValue(),'');
     await p.reload();await p.waitForFunction(()=>document.querySelectorAll('.job').length===2);
     assert.equal(await p.locator('[data-clear]').count(),1);assert.match(await p.locator('.job').first().textContent(),/下午：测试乙/);
+    assert.match(await p.locator('#nextStep').textContent(),/人员选择已完成.*生成到岗到位/s);
     await p.locator('#summaryA').click();await p.waitForFunction(()=>document.getElementById('textA').value.includes('【完整版】'));
+    await p.evaluate(async()=>setModel(await api('update',{edits:[{kind:'risk',row:4,field:'work',value:'措辞不同的设备作业'}]})));
+    assert.match(await p.locator('#alerts').textContent(),/待人工判断.*整理后第 1 项（原表第 4 行）/s);
+    await p.locator('[data-issue]').first().click();assert.equal(await p.locator('#fixCompare .compare-value').count(),2);assert.equal(await p.locator('#fixChoices button').count(),2);await p.locator('[data-close=fixDialog]').click();
+    const fakeResult={folder:'C:/测试源表/（处理后）',files:['现场（到岗到位）.pdf','计划（风险管控）.pdf'],summaries:{a:'模式 A',b:'模式 B'},warnings:[]};
+    await p.route('**/api/status',route=>route.fulfill({json:{status:{busy:false,phase:'完成',log:[],error:''},result:fakeResult}}));
+    await p.evaluate(()=>poll());
+    assert.equal(await p.locator('dialog[open]').count(),0,'generation must not open print preview');
+    assert.match(await p.locator('#outputLocation').textContent(),/测试源表.*（处理后）/);
+    await p.route('**/api/file?**',route=>route.fulfill({contentType:'text/plain',body:'PDF fixture'}));
+    await p.locator('#preview').click();
+    assert.equal(await p.locator('#pdfDialog').isVisible(),true);
+    assert.equal(await p.locator('#pdfSelect option').count(),2);
+    await p.locator('#pdfSelect').selectOption('计划（风险管控）.pdf');
+    assert.match(decodeURIComponent(await p.locator('#pdfDownload').getAttribute('href')),/风险管控/);
+    await p.locator('[data-close=pdfDialog]').click();
     await p.screenshot({path:path.join(out,'workbench.png'),fullPage:true});
     // An untrusted origin cannot trigger local processing even with a guessed port.
     const blocked=await p.evaluate(async()=>{const r=await fetch('/api/update',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"edits":[]}'});return r.status;});assert.equal(blocked,403);

@@ -67,6 +67,22 @@ class DailyTests(unittest.TestCase):
         self.assertTrue(any('O4' in str(v.sqref) for v in w.worksheets[0].data_validations.dataValidation))
         self.assertEqual(w.worksheets[0]['R4'].fill.fgColor.rgb[-6:],'FFFF00')
 
+    def test_filling_styled_empty_cell_preserves_adjacent_key_fields(self):
+        w=load_workbook(io.BytesIO(sample()));ws=w.worksheets[0]
+        ws['O4'].font=Font(size=48,bold=True)  # WPS serializes this as <c .../>.
+        ws['Q4']='关键地点';ws['T4']='督查原文'
+        raw=io.BytesIO();w.save(raw);data=raw.getvalue()
+        original=d.read_document('9月7日现场.xlsx',data,'site');doc=copy.deepcopy(original)
+        doc['records'][0]['same']='上午：测试甲\n下午：测试乙'
+        after=load_workbook(io.BytesIO(d.patch_package(data,doc,original)))
+        for row in ws:
+            for cell in row:
+                actual=after.worksheets[0][cell.coordinate]
+                self.assertEqual(actual.value,doc['records'][0]['same'] if cell.coordinate=='O4' else cell.value,cell.coordinate)
+                self.assertEqual(actual.style_id,cell.style_id,cell.coordinate)
+        self.assertEqual(after.worksheets[0]['P4'].value,'附件4-31-领导人员')
+        after.close();w.close()
+
     def test_x14_validation_read_and_preserve(self):
         data=sample();out=io.BytesIO()
         with ZipFile(io.BytesIO(data)) as a,ZipFile(out,'w',ZIP_DEFLATED) as b:
@@ -101,7 +117,10 @@ class DailyTests(unittest.TestCase):
         docs={k:d.read_document('9月7日'+k+'.xlsx',sample(k),k) for k in ('site','risk')}
         self.assertFalse(any(i['code'] in ('COUNT','CROSS_TIME','UNMATCHED') for i in d.audit(docs)))
         docs['risk']['records'][0]['start']='2026-09-07 09:00'
-        self.assertTrue(any(i['code']=='CROSS_TIME' and i['suggestion']=='2026-09-07 08:00' for i in d.audit(docs)))
+        cross=next(i for i in d.audit(docs) if i['code']=='CROSS_TIME')
+        self.assertEqual(cross['certainty'],'uncertain');self.assertIsNone(cross['suggestion'])
+        self.assertEqual(len(cross['comparison']),2);self.assertEqual(len(cross['choices']),2)
+        self.assertEqual({c['edit']['kind'] for c in cross['choices']},{'site','risk'})
         for value in ('2026-02-30 08:00','08:30','2026-09-07 25:00'):
             self.assertIsNone(d.parse_time(value)[0])
         docs['site']['records'][0]['end']='2026-09-07 06:00';self.assertIn('TIME_ORDER',[i['code'] for i in d.audit(docs)])
@@ -113,8 +132,10 @@ class DailyTests(unittest.TestCase):
         docs['risk']['records'].reverse()
         self.assertFalse(any(i['code'] in ('COUNT','UNMATCHED','CROSS_TIME') for i in d.audit(docs)))
         docs['risk']['records'][0]['work']='措辞稍有不同'
-        codes=[i['code'] for i in d.audit(docs)]
+        issues=d.audit(docs);codes=[i['code'] for i in issues]
         self.assertIn('CROSS_WORK',codes);self.assertNotIn('UNMATCHED',codes)
+        cross=next(i for i in issues if i['code']=='CROSS_WORK')
+        self.assertEqual(len(cross['comparison']),2);self.assertEqual(len(cross['choices']),2)
         self.assertEqual(docs['site']['cleanup']['exampleRowsRemoved'],[3])
         self.assertIn(6,docs['site']['cleanup']['blankRowsRemoved'])
 
