@@ -926,9 +926,12 @@ def generate_excel_output_v5(daily_data, start_date, end_date, src):
     safe_print("  📄 正在计算明细表不跨行分页位置...")
     apply_no_split_page_breaks(ws_out, data_start_row, data_end_row)
     setup_a3_print(ws_out, data_end_row, total_cols)
-    filename = os.path.splitext(os.path.basename(src))[0]
-    out_name = f"{filename}（周计划明细）.xlsx"
+    from source_processor import output_folder, detail_name
+    folder = output_folder(os.path.dirname(os.path.abspath(src)))
+    folder.mkdir(parents=True, exist_ok=True)
+    out_name = folder / detail_name(src, str(ws_out['A1'].value or ''))
     wb_out.save(out_name)
+    wb_out.close()
     safe_print(f"💾 已保存周计划明细: {out_name}")
 def generate_risk_txt(all_files):
     safe_print("\n📝 正在生成三四五级风险汇总 TXT...")

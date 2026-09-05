@@ -11,7 +11,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Border, Side
 from source_processor import (Report, SourceError, working_copy, process_file, preprocess_sheet,
                               auto_width, auto_height, split_overflow, output_name, scan_sources,
-                              validate_time, format_sheet, trim_inflated_copy)
+                              validate_time, format_sheet, trim_inflated_copy, detail_name, output_folder)
 
 
 def fixture(path):
@@ -54,6 +54,7 @@ class SourceTests(unittest.TestCase):
     def test_backup_readonly_cleanup_and_pipeline(self):
         original=self.src.read_bytes()
         target,report=process_file(self.src, preserve_widths=False)
+        self.assertEqual(target,self.root/'（处理后）'/self.src.name)
         self.assertEqual(original,self.src.read_bytes())
         backup=self.root/'源文件备份'/self.src.name
         self.assertEqual(original,backup.read_bytes())
@@ -98,7 +99,7 @@ class SourceTests(unittest.TestCase):
         with patch('source_processor.format_sheet',side_effect=RuntimeError('output failure')):
             with self.assertRaises(SourceError): process_file(self.src)
         self.assertFalse((self.root/'work').exists())
-        report=json.loads(next(self.root.glob('*.报告.json')).read_text('utf-8'))
+        report=json.loads(next((self.root/'（处理后）').glob('*.报告.json')).read_text('utf-8'))
         self.assertIn('OUTPUT_FAILED',[i['code'] for i in report['issues']])
 
     def test_small_rows_and_whole_row_trigger(self):
@@ -196,12 +197,36 @@ class SourceTests(unittest.TestCase):
         with self.assertRaises(SourceError):preprocess_sheet(ws,Report())
 
     def test_names_scanning(self):
-        self.assertEqual(output_name('表1（第36周）.xlsx'),'（第36周）（处理后的源表）.xlsx')
-        self.assertEqual(output_name('源表.xlsx'),'源表（处理后的源表）.xlsx')
-        self.assertEqual(output_name('源表.xlsx','第九周'),'（第九周）（处理后的源表）.xlsx')
+        self.assertEqual(output_name('表1（第36周）.xlsx'),'表1（第36周）.xlsx')
+        self.assertEqual(output_name('源表.xlsx'),'源表.xlsx')
+        self.assertEqual(output_name('源表.xlsx','第九周'),'源表.xlsx')
+        self.assertEqual(detail_name('表1：每周重点作业计划（第36周）.xlsx'),'（第36周）（周计划明细）.xlsx')
+        self.assertEqual(detail_name('表1(第 37 周).xlsx'),'（第37周）（周计划明细）.xlsx')
+        self.assertEqual(detail_name('表1.xlsx','第九周'),'（第九周）（周计划明细）.xlsx')
+        self.assertEqual(detail_name('表1.xlsx'),'周计划明细.xlsx')
         for name in ['~$表1.xlsx','周计划明细.xlsx','表1（处理后的源表）.xlsx']:(self.root/name).touch()
         (self.root/'work').mkdir();(self.root/'work'/'表1.xlsx').touch()
+        processed=self.root/'（处理后）';processed.mkdir();(processed/self.src.name).touch()
+        self.assertEqual(output_folder(processed),processed)
         self.assertEqual(scan_sources(self.root),[self.src])
+
+    def test_output_never_overwrites_same_name_original(self):
+        target,_=process_file(self.src)
+        before=target.read_bytes()
+        with self.assertRaisesRegex(SourceError,'原件路径相同'):
+            process_file(target)
+        self.assertEqual(before,target.read_bytes())
+
+    def test_detail_saved_beside_source_in_processed_folder(self):
+        from datetime import datetime
+        spec=importlib.util.spec_from_file_location('weekly_export',Path(__file__).resolve().parents[1]/'weekly-plan-export.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        start=datetime(2026,8,31);end=datetime(2026,9,6)
+        with patch.object(module,'safe_print'):
+            module.generate_excel_output_v5({},start,end,str(self.src))
+        expected=self.root/'（处理后）'/'（第36周）（周计划明细）.xlsx'
+        self.assertTrue(expected.exists())
+        wb=load_workbook(expected);self.assertEqual(wb.active.title,'周计划明细');wb.close()
 
 
 if __name__=='__main__':unittest.main()

@@ -12,8 +12,13 @@ vm.createContext(ctx);vm.runInContext(bundle+'\nthis.WP=WeeklyPlan;',ctx);
 const WP=ctx.WP, SP=WP.sourceProcessor;
 // The exposed factory accepts the already loaded library; use the bundled sample writer for load coverage.
 async function main() {
-  assert.equal(SP.outputName('表1（第36周）.xlsx'),'（第36周）（处理后的源表）.xlsx');
-  assert.equal(SP.outputName('源表.xlsx'),'源表（处理后的源表）.xlsx');
+  assert.equal(SP.outputName('表1（第36周）.xlsx'),'表1（第36周）.xlsx');
+  assert.equal(SP.outputName('源表.xlsx'),'源表.xlsx');
+  assert.equal(SP.detailName('表1：每周重点作业计划(第 36 周).xlsx'),'（第36周）（周计划明细）.xlsx');
+  assert.equal(SP.detailName('源表.xlsx','第37周'),'（第37周）（周计划明细）.xlsx');
+  assert.equal(SP.detailName('源表.xlsx'),'周计划明细.xlsx');
+  assert(!SP.isSource('（处理后）/表1.xlsx'));
+  await assert.rejects(SP.outputZip([{name:'../表1.xlsx',data:'bad'}]),/输出文件名无效/);
   for(const name of ['~$表1.xlsx','明细.xlsx','处理后的源表.xlsx','work/表1.xlsx']) assert(!SP.isSource(name));
   for(const [value,code] of [['2026/2/30 08:30-17:30','DATE_INVALID'],['08:30-17:30','TIME_DATE_MISSING'],['2026/9/1 25:00-26:00','TIME_INVALID'],['2026/9/1 17:30-08:30','TIME_ORDER'],['2026/9/1 上午','TIME_FORMAT']]) {
     const log=SP.report('测试');const [out]=SP.validateTime(value,log,'D4');
@@ -26,6 +31,8 @@ async function main() {
   for(const row of parsed.rows) row[index]='ONLY_SOURCE_MEASURES_SENTINEL';
   const detail=WP.runPipeline({...parsed,sourceName:'样例.xlsx',measuresPlus:1});
   assert(!JSON.stringify(detail.layout).includes('ONLY_SOURCE_MEASURES_SENTINEL'),'weekly detail must exclude measures');
+  const detailBytes=await WP.writeWeeklyPlanXlsx(detail.layout);
+  assert(detailBytes.byteLength>1000);
   const output=await SP.processBuffer(sample,'样例（第36周）.xlsx',1);
   assert(output.buffer.byteLength>1000);
   assert.deepEqual(Array.from(output.report.stages),['preprocess','width','height','insert','output']);

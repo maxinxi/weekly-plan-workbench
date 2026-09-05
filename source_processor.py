@@ -108,7 +108,7 @@ def is_source(path):
     p = Path(path)
     return (p.suffix.lower() == ".xlsx" and not p.name.startswith("~$")
             and not any(s in p.stem for s in ("明细", "处理后", "处理后的"))
-            and not any(s.lower() == "work" or s == "源文件备份" for s in p.parts))
+            and not any(s.lower() == "work" or s in ("源文件备份", "（处理后）") for s in p.parts))
 
 
 def scan_sources(directory="."):
@@ -599,18 +599,28 @@ def setup_source_print(ws, header, cols, report):
 
 
 def output_name(source, title=""):
+    return Path(source).name
+
+
+def detail_name(source, title=""):
     match = re.search(r"第\s*([0-9一二三四五六七八九十百]+)\s*周", Path(source).stem)
     if not match:
         match = re.search(r"第\s*([0-9一二三四五六七八九十百]+)\s*周", title)
-    stem = f"（第{match[1]}周）" if match else Path(source).stem
-    return stem + "（处理后的源表）.xlsx"
+    return f"（第{match[1]}周）（周计划明细）.xlsx" if match else "周计划明细.xlsx"
+
+
+def output_folder(base):
+    base = Path(base).resolve()
+    return base if base.name == "（处理后）" else base / "（处理后）"
 
 
 def process_file(source, plus=MEASURES_HEIGHT_PLUS, output_dir=None, preserve_widths=True):
     source = Path(source).resolve()
     report = Report(source.name)
-    target_dir = Path(output_dir) if output_dir else source.parent
+    target_dir = output_folder(output_dir if output_dir else source.parent)
     target = target_dir / output_name(source)
+    if target.resolve() == source:
+        raise SourceError("输出与原件路径相同，请选择其他输出目录；原件不会覆盖")
     report_path = target.with_suffix(".报告.json")
     wb = None
     try:
@@ -645,6 +655,7 @@ def process_file(source, plus=MEASURES_HEIGHT_PLUS, output_dir=None, preserve_wi
             wb.close()
         report.stages.append("work_cleanup")
         try:
+            target_dir.mkdir(parents=True, exist_ok=True)
             report_path.write_text(json.dumps(report.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
         except OSError as exc:
             print(f"报告写入失败：{exc}\n" + json.dumps(report.as_dict(), ensure_ascii=False))

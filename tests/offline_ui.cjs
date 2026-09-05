@@ -13,6 +13,7 @@ async function main() {
     const page=await context.newPage();
     const errors=[],requests=[];
     page.on('pageerror',e=>errors.push(e.message));
+    page.on('console',m=>{if(m.type()==='error') console.error(m.text());});
     page.on('request',r=>{if(/^https?:/.test(r.url()))requests.push(r.url());});
     await page.goto(pathToFileURL(path.resolve(__dirname,'../周计划工作台.html')).href);
     let bytes,name;
@@ -26,14 +27,15 @@ async function main() {
     const report=await page.evaluate(()=>sourceReport);
     assert(!report.issues.some(i=>i.code==='BACKUP_MEMORY_ONLY'),'IndexedDB backup should work offline');
     assert.deepEqual(report.stages,['backup_work','preprocess','width','height','insert','output','work_cleanup']);
-    const download=page.waitForEvent('download');await page.locator('#btnProcessedSrc').click();
-    const file=await download;
-    assert(file.suggestedFilename().includes('处理后的源表'));
+    assert.equal(await page.locator('#btnOutputDirectory').count(),0,'no directory selection');
+    const download=page.waitForEvent('download');await page.locator('#btnExportAll').click();
+    const file=await download.catch(async e=>{console.error(await page.evaluate(()=>({issues:sourceReport.issues.filter(i=>i.level==='error'),result:!!result,exporting})));throw e;});
+    assert.equal(file.suggestedFilename(),'（处理后）.zip');
     assert.equal(await file.failure(),null);
     if(process.argv[3]) {
       fs.mkdirSync(process.argv[3],{recursive:true});
       await file.saveAs(path.join(process.argv[3],file.suggestedFilename()));
-      fs.writeFileSync(path.join(process.argv[3],file.suggestedFilename().replace(/\.xlsx$/,'.报告.json')),JSON.stringify(report,null,2));
+      fs.writeFileSync(path.join(process.argv[3],'source.报告.json'),JSON.stringify(report,null,2));
     }
     // Reload proves the original backup lives in IndexedDB, not a JavaScript variable.
     await page.reload();

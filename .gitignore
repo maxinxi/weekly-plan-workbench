@@ -8,5 +8,6 @@ __pycache__/
 .DS_Store
 work/
 源文件备份/
+（处理后）/
 *（处理后的源表）.xlsx
 *.报告.json

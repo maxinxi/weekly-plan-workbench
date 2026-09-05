@@ -117,7 +117,9 @@
           <section class="card" style="margin-top:14px">
             <p class="tiny">EXPORT</p>
             <h2>导出</h2>
+            <p class="muted">下载ZIP，解压得到「（处理后）」文件夹，源表保留原名，明细仅用周次命名。浏览器无法自动写回导入文件所在目录。</p>
             <div class="stack">
+              <button class="btn" id="btnExportAll">保存源表及明细</button>
               <button class="btn" id="btnExcel2">周计划明细 Excel</button>
               <button class="btn" id="btnProcessedSrc">处理后的源表</button>
               <button class="btn-outline" id="btnRisk">三四五级风险 TXT</button>
@@ -25350,87 +25352,11 @@ var WeeklyPlan = (() => {
     }
     mergeDateColumns(ws, layout);
     mergeContinuationCells(ws, layout);
-    // 明细内容行插行：选中所有有数据的列，统一插行（仿日计划 AutoFitRowEx，不逐格测量）
-    {
-      const origMerges = readSourceMerges(ws);
-      for (const m of origMerges) {
-        try { ws.unMergeCells(m.top, m.left, m.bottom, m.right); } catch { }
-      }
-      for (const m of origMerges) {
-        for (let rr = m.top; rr <= m.bottom; rr++) {
-          for (let cc = m.left; cc <= m.right; cc++) {
-            if (rr === m.top && cc === m.left) continue;
-            try { ws.getCell(rr, cc).value = null; } catch { }
-          }
-        }
-      }
-      const ops = [];
-      const plan = [];
-      for (const row of layout.rows) {
-        if (row.kind !== "content") continue;
-        const dataCols = [];
-        let maxEst = 0;
-        for (const c of row.cells) {
-          const text = String(c.value ?? "");
-          if (!text.trim()) continue;
-          dataCols.push(c.col);
-          const w = ws.getColumn(c.col).width || 25;
-          maxEst = Math.max(maxEst, estimateTextHeight(text, w));
-        }
-        plan.push({ row: row.row, dataCols, maxEst });
-      }
-      for (let i = plan.length - 1; i >= 0; i--) {
-        const p = plan[i];
-        if (p.dataCols.length === 0) continue;
-        p.rowsNeeded = Math.max(1, Math.ceil((p.maxEst + 0.5) / EXCEL_MAX_ROW_HEIGHT));
-        const rowsToInsert = p.rowsNeeded - 1;
-        for (let k = 0; k < rowsToInsert; k++) {
-          try {
-            ws.spliceRows(p.row + 1, 0, {});
-            ops.push({ at: p.row + 1, count: 1 });
-          } catch { }
-        }
-      }
-      const shiftRow = (orig) => {
-        let r2 = orig;
-        for (const op of ops) if (op.at <= orig) r2 += op.count;
-        return r2;
-      };
-      for (const m of origMerges) {
-        const top = shiftRow(m.top);
-        const bottom = shiftRow(m.bottom);
-        if (bottom >= top) {
-          try { ws.mergeCells(top, m.left, bottom, m.right); } catch { }
-        }
-      }
-      for (const p of plan) {
-        const r = shiftRow(p.row);
-        if ((p.rowsNeeded ?? 1) > 1) {
-          for (const col of p.dataCols) {
-            try { ws.mergeCells(r, col, r + p.rowsNeeded - 1, col); } catch { }
-          }
-          // 扩展该内容行所在块的 A 列日期合并（表头+领导+内容+续行）
-          for (const m2 of readSourceMerges(ws)) {
-            if (m2.left === 1 && m2.right === 1 && m2.top <= r && r <= m2.bottom) {
-              try {
-                ws.unMergeCells(m2.top, 1, m2.bottom, 1);
-                ws.mergeCells(m2.top, 1, Math.max(m2.bottom, r + p.rowsNeeded - 1), 1);
-              } catch { }
-              break;
-            }
-          }
-          const per = Math.min(EXCEL_MAX_ROW_HEIGHT, p.maxEst / p.rowsNeeded);
-          for (let k = 0; k < p.rowsNeeded; k++) {
-            try { ws.getRow(r + k).height = per; } catch { }
-          }
-        }
-      }
-      for (const br of layout.breakRows) {
-        const newBr = shiftRow(br);
-        if (newBr > 1) ws.getRow(newBr - 1).addPageBreak();
-      }
-      ws.pageSetup.printArea = `A1:${colLetter(TOTAL_COLS)}${ws.rowCount}`;
+    // Layout already includes continuation rows; preserve that single plan.
+    for (const br of layout.breakRows) {
+      if (br > 1) ws.getRow(br - 1).addPageBreak();
     }
+    ws.pageSetup.printArea = `A1:${colLetter(TOTAL_COLS)}${ws.rowCount}`;
     const buf = await wb.xlsx.writeBuffer();
     return buf;
   }
@@ -25757,9 +25683,12 @@ function createSourceProcessor(ExcelJS) {
     return inserted;
   }
   function outputName(filename, title="") {
+    return filename.split(/[\\/]/).pop();
+  }
+  function detailName(filename, title="") {
     const stem=filename.replace(/\.xlsx$/i,"");
     const m=/第\s*([0-9一二三四五六七八九十百]+)\s*周/.exec(stem)||/第\s*([0-9一二三四五六七八九十百]+)\s*周/.exec(title);
-    return (m?`（第${m[1]}周）`:stem)+"（处理后的源表）.xlsx";
+    return m?`（第${m[1]}周）（周计划明细）.xlsx`:"周计划明细.xlsx";
   }
   function setupSourcePrint(ws, header, cols, log) {
     const originalScale=ws.pageSetup.scale;
@@ -25941,7 +25870,15 @@ function createSourceProcessor(ExcelJS) {
     u32(e,0x06054b50);u16(e+8,1);u16(e+10,1);u32(e+12,46+name.length);u32(e+16,p);
     return result;
   }
-  return {processBuffer,processFile,preprocessBuffer,outputName,isSource,backupZip,getBackup,backupOnce,
+  async function outputZip(files) {
+    const zip=new ExcelJS.SourceZip();
+    for(const file of files) {
+      if(!file.name || /[\\/]/.test(file.name) || file.name==='.' || file.name==='..') throw new Error('输出文件名无效');
+      zip.file('（处理后）/'+file.name,file.data);
+    }
+    return zip.generateAsync({type:'uint8array',compression:'DEFLATE'});
+  }
+  return {processBuffer,processFile,preprocessBuffer,outputName,detailName,outputZip,isSource,backupZip,getBackup,backupOnce,
     work,report,preprocess,autoWidth,autoHeight,splitOverflow,validateTime,width,columnMap};
 }
 if (typeof module !== "undefined" && module.exports) module.exports = {createSourceProcessor};
@@ -26051,6 +25988,7 @@ if (typeof module !== "undefined" && module.exports) module.exports = {createSou
       let sourceOutput = null;
       let sourceReport = null;
       let importing = false;
+      let exporting = false;
       let importVersion = 0;
       let panel = "sheet";
       const $ = (id) => document.getElementById(id);
@@ -26071,6 +26009,21 @@ if (typeof module !== "undefined" && module.exports) module.exports = {createSou
       function escapeHtml(s) {
         return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
       }
+      async function saveOutput(files) {
+        if (exporting) return;
+        exporting = true;
+        renderSourceStatus();
+        try {
+          downloadBlob(new Blob([await WP.sourceProcessor.outputZip(files)], {type:"application/zip"}), "（处理后）.zip");
+          toast("已下载ZIP，解压后文件统一在「（处理后）」中");
+        } catch(e) {
+          toast("保存失败：" + e.message);
+          if(sourceReport) {
+            sourceReport.issues.push({level:"error",code:"OUTPUT_FAILED",message:"保存失败："+e.message});
+            panel="log";render();
+          }
+        } finally {exporting=false;renderSourceStatus();}
+      }
       function rebuild(nextPlus) {
         plus = nextPlus;
         result = WP.runPipeline({
@@ -26089,7 +26042,8 @@ if (typeof module !== "undefined" && module.exports) module.exports = {createSou
         $("sourceStatus").textContent = importing ? "正在备份并处理源表…" : sourceOutput
           ? `源表已整理：删除${sourceOutput.deletedRows}行，插入${sourceOutput.inserted}行；${errors}项错误，${warnings}项警告。请在处理日志核对。`
           : sourceReport ? "源表未能导出，请查看处理日志或下载报告。" : "尚未导入源表";
-        for (const id of ["btnProcessedSrc", "btnHeaderProcessedSrc"]) $(id).disabled = importing || !sourceOutput;
+        for (const id of ["btnProcessedSrc", "btnHeaderProcessedSrc", "btnExportAll"]) $(id).disabled = importing || exporting || !sourceOutput;
+        for (const id of ["btnExcel", "btnExcel2", "btnRisk", "btnSum"]) $(id).disabled = importing || exporting || !result;
         $("btnBackup").disabled = importing || !sourceFile;
         $("btnSourceReport").disabled = importing || !sourceReport;
         $("measuresPlus").disabled = importing;
@@ -26134,19 +26088,29 @@ if (typeof module !== "undefined" && module.exports) module.exports = {createSou
       async function downloadExcel() {
         if (!result) { toast("请先修正源表报告中的数据错误"); return; }
         const buf = await WP.writeWeeklyPlanXlsx(result.layout);
-        const weekMatch = result.sourceName.match(/（第[0-9一二三四五六七八九十百千]+周）/);
-        const name = (weekMatch ? weekMatch[0] : result.sourceName.replace(/\.xlsx$/i, "")) + "（周计划明细）.xlsx";
-        downloadBlob(new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), name);
-        toast("明细表已下载");
+        const name = WP.sourceProcessor.detailName(result.sourceName,result.title);
+        await saveOutput([{name,data:buf}]);
       }
       async function downloadProcessedSource() {
         if (!sourceOutput) { toast("请先导入源表"); return; }
         try {
-          downloadBlob(new Blob([sourceOutput.buffer], {type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}), sourceOutput.filename);
-          toast("已下载：" + sourceOutput.filename);
+          await saveOutput([{name:sourceOutput.filename,data:sourceOutput.buffer}]);
         } catch(e) {
           sourceReport.issues.push({level:"error",code:"OUTPUT_FAILED",message:"下载失败：" + e.message});
           panel="log"; render(); renderSourceStatus();
+        }
+      }
+      async function exportAll() {
+        if (!sourceOutput) return;
+        const src=sourceOutput, detail=result;
+        const files=[{name:src.filename,data:src.buffer},
+          {name:src.filename.replace(/\.xlsx$/i,".报告.json"),data:JSON.stringify(sourceReport,null,2)}];
+        try {
+          if(detail) files.push({name:WP.sourceProcessor.detailName(detail.sourceName,detail.title),data:await WP.writeWeeklyPlanXlsx(detail.layout)});
+          await saveOutput(files);
+        } catch(e) {
+          sourceReport.issues.push({level:"error",code:"OUTPUT_FAILED",message:"生成文件失败："+e.message});
+          panel="log";render();toast("生成文件失败："+e.message);
         }
       }
       function renderSheet() {
@@ -26238,15 +26202,16 @@ if (typeof module !== "undefined" && module.exports) module.exports = {createSou
         try { if (sourceFile) downloadBlob(new Blob([await WP.sourceProcessor.backupZip(sourceFile.name)], {type:"application/zip"}), "源文件备份.zip"); }
         catch(e) { toast("备份下载失败：" + e.message); }
       };
+      $("btnExportAll").onclick = exportAll;
       $("btnSourceReport").onclick = () => {
-        if(sourceReport) downloadBlob(new Blob([JSON.stringify(sourceReport,null,2)], {type:"application/json;charset=utf-8"}), (sourceOutput?.filename || sourceFile.name) + ".报告.json");
+        if(sourceReport) saveOutput([{name:(sourceOutput?.filename || sourceFile.name).replace(/\.xlsx$/i,".报告.json"),data:JSON.stringify(sourceReport,null,2)}]);
       };
       $("btnExcel").onclick = downloadExcel;
       $("btnHeaderProcessedSrc").onclick = downloadProcessedSource;
       $("btnExcel2").onclick = downloadExcel;
       $("btnProcessedSrc").onclick = downloadProcessedSource;
-      $("btnRisk").onclick = () => { downloadBlob(new Blob([result.riskTxt], { type: "text/plain;charset=utf-8" }), "三四五级风险汇总(简化版).txt"); toast("文本已下载"); };
-      $("btnSum").onclick = () => { downloadBlob(new Blob([result.summaryTxt], { type: "text/plain;charset=utf-8" }), "周计划项目汇总.txt"); toast("文本已下载"); };
+      $("btnRisk").onclick = () => saveOutput([{name:"三四五级风险汇总(简化版).txt",data:result.riskTxt}]);
+      $("btnSum").onclick = () => saveOutput([{name:"周计划项目汇总.txt",data:result.summaryTxt}]);
       $("btnSampleSrc").onclick = async () => {
         const buf = await WP.writeSampleSourceXlsx();
         downloadBlob(new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), "城东供电所周计划表1（示例）.xlsx");

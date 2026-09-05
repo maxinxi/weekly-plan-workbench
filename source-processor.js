@@ -319,9 +319,12 @@ function createSourceProcessor(ExcelJS) {
     return inserted;
   }
   function outputName(filename, title="") {
+    return filename.split(/[\\/]/).pop();
+  }
+  function detailName(filename, title="") {
     const stem=filename.replace(/\.xlsx$/i,"");
     const m=/第\s*([0-9一二三四五六七八九十百]+)\s*周/.exec(stem)||/第\s*([0-9一二三四五六七八九十百]+)\s*周/.exec(title);
-    return (m?`（第${m[1]}周）`:stem)+"（处理后的源表）.xlsx";
+    return m?`（第${m[1]}周）（周计划明细）.xlsx`:"周计划明细.xlsx";
   }
   function setupSourcePrint(ws, header, cols, log) {
     const originalScale=ws.pageSetup.scale;
@@ -503,7 +506,15 @@ function createSourceProcessor(ExcelJS) {
     u32(e,0x06054b50);u16(e+8,1);u16(e+10,1);u32(e+12,46+name.length);u32(e+16,p);
     return result;
   }
-  return {processBuffer,processFile,preprocessBuffer,outputName,isSource,backupZip,getBackup,backupOnce,
+  async function outputZip(files) {
+    const zip=new ExcelJS.SourceZip();
+    for(const file of files) {
+      if(!file.name || /[\\/]/.test(file.name) || file.name==='.' || file.name==='..') throw new Error('输出文件名无效');
+      zip.file('（处理后）/'+file.name,file.data);
+    }
+    return zip.generateAsync({type:'uint8array',compression:'DEFLATE'});
+  }
+  return {processBuffer,processFile,preprocessBuffer,outputName,detailName,outputZip,isSource,backupZip,getBackup,backupOnce,
     work,report,preprocess,autoWidth,autoHeight,splitOverflow,validateTime,width,columnMap};
 }
 if (typeof module !== "undefined" && module.exports) module.exports = {createSourceProcessor};
