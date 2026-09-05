@@ -89,6 +89,12 @@ def canonical(value):
     return re.sub(r'\s+', '', text(value)).replace('：', ':').replace('（', '(').replace('）', ')').lower()
 
 
+def personnel_level_needs_leader(value):
+    """Only the explicit 领导人员 category participates in leader selection."""
+    value = canonical(value)
+    return bool(value and '领导人员' in value and '管理人员' not in value and '业务骨干' not in value)
+
+
 def col_num(s):
     n = 0
     for ch in s.upper():
@@ -183,26 +189,39 @@ def read_document(name, data, kind):
                   owner=find('负责人'), risk=find('作业风险'), grid=find('电网风险'))
     if kind == 'site':
         fields.update(same=find('同进同出人员'), profession=find('管理专业'), unit=find('检修(施工)单位'),
-                      attendance=find('到岗到位人员'))
+                      attendance=find('到岗到位人员'), sameLevel=find('同进同出人员层级'))
         # Never match the similarly named 人员层级 column.
         fields['same'] = next((c for h, c in headers.items() if h == '同进同出人员'), None)
     missing = [k for k, v in fields.items() if not v]
     if missing:
-        labels = {'work':'工作内容','start':'计划开始时间','end':'计划竣工时间','owner':'负责人', 'same':'同进同出人员','risk':'作业风险等级','grid':'电网风险等级','profession':'管理专业','unit':'检修（施工）单位','attendance':'到岗到位人员'}
+        labels = {'work':'工作内容','start':'计划开始时间','end':'计划竣工时间','owner':'负责人', 'same':'同进同出人员','sameLevel':'同进同出人员层级','risk':'作业风险等级','grid':'电网风险等级','profession':'管理专业','unit':'检修（施工）单位','attendance':'到岗到位人员'}
         raise ValueError(name + ' 缺少必需列：' + '、'.join(labels[x] for x in missing))
     rules = validation_rules(data) if kind == 'site' else []
     example_rows = [r for r in range(3, ws.max_row+1) if '例' in text(ws.cell(r,1).value)]
     example_rule = next((rule for r in example_rows for rule in rules if in_sqref(f'{get_column_letter(fields["same"])}{r}', rule['sqref'])), None) if kind == 'site' else None
     records = []
+    blank_rows = []
+    skipped_rows = []
+    logical_last_col = max(fields.values())
     for r in range(3, ws.max_row+1):
-        # Merged continuation cells have no work value; they never count as another job.
-        if r in example_rows or not text(ws.cell(r,fields['work']).value):
+        if r in example_rows:
+            continue
+        row_has_value = any(text(cached.worksheets[0].cell(r,c).value) for c in range(1,logical_last_col+1))
+        if not row_has_value:
+            blank_rows.append(r)
+            continue
+        # Merged continuation cells and non-work remnants never count as another job.
+        if not text(ws.cell(r,fields['work']).value):
+            skipped_rows.append(r)
             continue
         record = {'id': f'{kind}:{r}', 'row':r, 'seq':text(ws.cell(r,1).value)}
         record.update({key:text(cached.worksheets[0].cell(r,col).value) for key,col in fields.items()})
         if kind == 'site':
+            record['needsLeader'] = personnel_level_needs_leader(record['sameLevel'])
+            record['needsSelection'] = record['needsLeader'] and not bool(record['same'])
             addr = f'{get_column_letter(fields["same"])}{r}'
-            rule = next((x for x in rules if in_sqref(addr,x['sqref'])), example_rule)
+            own_rule = next((x for x in rules if in_sqref(addr,x['sqref'])), None)
+            rule = own_rule or (example_rule if record['needsSelection'] else None)
             record.update(options=[], formula=rule['formula'] if rule else '', formulaError='', inherited=bool(rule and not in_sqref(addr,rule['sqref'])))
             if rule:
                 try:
@@ -216,11 +235,13 @@ def read_document(name, data, kind):
                         record['formulaError'] = '关联范围没有可选人员'
                 except Exception as e:
                     record['formulaError'] = str(e)
-            else:
+            elif record['needsSelection']:
                 record['formulaError'] = '本行及示例行均未找到下拉关联，请手工填写或修好源表后重新导入'
         records.append(record)
     result = {'name': name, 'kind':kind, 'title':text(ws.cell(1,1).value), 'fields': fields,
-              'records':records, 'exampleRows':example_rows, 'hiddenSheets':[s.title for s in wb if s.sheet_state != 'visible']}
+              'records':records, 'exampleRows':example_rows, 'hiddenSheets':[s.title for s in wb if s.sheet_state != 'visible'],
+              'cleanup':{'exampleRowsRemoved':example_rows,'blankRowsRemoved':blank_rows,'nonWorkRowsExcluded':skipped_rows,
+                         'recordCount':len(records),'order':['删除示例行','排除空白行和合并续行','识别有效工作内容','再进行两表核对']}}
     wb.close(); cached.close()
     if not records:
         raise ValueError(name + ' 未找到有效作业记录')
@@ -236,6 +257,49 @@ def parse_time(value):
         return datetime(*map(int,m.groups())), ''
     except ValueError:
         return None, '日期非法或时间超出有效范围'
+
+
+def time_key(value):
+    parsed, _ = parse_time(value)
+    return parsed.isoformat(timespec='minutes') if parsed else canonical(value)
+
+
+def owner_key(value):
+    value = text(value)
+    phone = re.findall(r'(?<!\d)1\d{10}(?!\d)',value)
+    return phone[0] if phone else canonical(re.sub(r'\d+','',value))
+
+
+def match_records(site, risk):
+    """Match cleaned records without using row order or fuzzy guesses."""
+    left = {i:r for i,r in enumerate(site)}
+    right = {i:r for i,r in enumerate(risk)}
+    pairs = []
+
+    def take_unique(keyfn, label):
+        left_groups, right_groups = defaultdict(list), defaultdict(list)
+        for index,record in left.items():
+            key = keyfn(record)
+            if key:
+                left_groups[key].append(index)
+        for index,record in right.items():
+            key = keyfn(record)
+            if key:
+                right_groups[key].append(index)
+        for key in sorted(set(left_groups) & set(right_groups),key=str):
+            if len(left_groups[key]) == len(right_groups[key]) == 1:
+                left_index,right_index = left_groups[key][0],right_groups[key][0]
+                pairs.append((left.pop(left_index),right.pop(right_index),label))
+
+    # First use the strongest business anchor. Wording differences fall back to a
+    # unique owner/phone + start + end composite. Both paths ignore row order.
+    take_unique(lambda record:canonical(record['work']),'工作内容')
+    take_unique(lambda record:(owner_key(record['owner']),time_key(record['start']),time_key(record['end'])) if owner_key(record['owner']) else None,
+                '负责人＋开始时间＋结束时间')
+    # Repeated work descriptions are paired only when all identity fields are unique.
+    take_unique(lambda record:(canonical(record['work']),owner_key(record['owner']),time_key(record['start']),time_key(record['end'])),
+                '复合作业锚点')
+    return pairs,list(left.values()),list(right.values())
 
 
 def audit(documents):
@@ -267,32 +331,24 @@ def audit(documents):
                     issue('ROW_DATE','作业日期与标题日期不一致，请核实跨日计划',kind,record['row'],field,record[field])
             if all(dates) and dates[1] <= dates[0]:
                 issue('TIME_ORDER','计划竣工时间不晚于开始时间',kind,record['row'],'end',record['end'])
-            if record.get('formulaError'):
+            if record.get('needsSelection') and not record.get('same') and record.get('formulaError'):
                 issue('DROPDOWN',record['formulaError'],kind,record['row'],'same',record.get('same',''))
     if 'site' in documents and 'risk' in documents:
         site,risk = documents['site']['records'],documents['risk']['records']
         if len(site) != len(risk):
             issue('COUNT',f'现场作业 {len(site)} 项，风险管控 {len(risk)} 项；请核对缺项/重复项，程序不代替新增或删除作业')
-        groups = [defaultdict(list),defaultdict(list)]
-        for group,records in zip(groups,(site,risk)):
-            for r in records:
-                group[canonical(r['work'])].append(r)
-        for key in set(groups[0]) | set(groups[1]):
-            left,right = groups[0][key],groups[1][key]
-            if len(left) == len(right) == 1:
-                a,b = left[0],right[0]
-                for field in ('start','end'):
-                    av,_ = parse_time(a[field]); bv,_ = parse_time(b[field])
-                    if (av and bv and av != bv) or (not (av and bv) and canonical(a[field]) != canonical(b[field])):
-                        issue('CROSS_TIME',f'同一作业两表时间不一致（现场第 {a["row"]} 行 / 风险第 {b["row"]} 行）；建议值来自现场表', 'risk',b['row'],field,b[field],a[field])
-            elif not left or not right:
-                for rec in left or right:
-                    issue('UNMATCHED','另一张表未找到相同工作内容，请人工核对；不会根据相近文字强行配对','site' if left else 'risk',rec['row'],'work',rec['work'])
-            else:
-                # Repeated descriptions are only paired when owner AND full start/end agree.
-                signature = lambda r:(canonical(r['owner']),r['start'],r['end'])
-                if Counter(map(signature,left)) != Counter(map(signature,right)):
-                    issue('AMBIGUOUS','相同工作内容出现多次且时间或负责人不一致，无法唯一配对，请人工核对','site',left[0]['row'],'work',left[0]['work'])
+        pairs,left_only,right_only = match_records(site,risk)
+        for a,b,anchor in pairs:
+            if canonical(a['work']) != canonical(b['work']):
+                issue('CROSS_WORK',f'锚点“{anchor}”对应到同一作业，但两表工作内容文字不一致（现场第 {a["row"]} 行 / 风险第 {b["row"]} 行）；只告警，不自动改文字','risk',b['row'],'work',b['work'])
+            for field in ('start','end'):
+                av,_ = parse_time(a[field]); bv,_ = parse_time(b[field])
+                if (av and bv and av != bv) or (not (av and bv) and canonical(a[field]) != canonical(b[field])):
+                    issue('CROSS_TIME',f'锚点“{anchor}”对应的作业时间不一致（现场第 {a["row"]} 行 / 风险第 {b["row"]} 行）；建议值来自现场表', 'risk',b['row'],field,b[field],a[field])
+        for record in left_only:
+            issue('UNMATCHED','初步整理后，风险表未找到唯一对应作业；顺序不参与核对，请按工作内容、负责人和时间锚点人工核实','site',record['row'],'work',record['work'])
+        for record in right_only:
+            issue('UNMATCHED','初步整理后，现场表未找到唯一对应作业；顺序不参与核对，请按工作内容、负责人和时间锚点人工核实','risk',record['row'],'work',record['work'])
     return issues
 
 
@@ -303,10 +359,10 @@ def summaries(doc, mode_b=False):
     for i,r in enumerate(doc['records'],1):
         start,_ = parse_time(r['start']); end,_ = parse_time(r['end'])
         same = mod.remove_phone_and_noise(r['same']) if r['same'] else ''
-        if not same:
+        if not same and r.get('needsSelection'):
             missing += 1
             same = f'需要领导{missing}'
-        records.append(dict(order=i,source_row=r['row'],seq=str(i),profession=mod.classify_profession(r['profession'],r['owner']),raw_profession=r['profession'],work=r['work'],unit=r['unit'],leader=mod.clean_person_name(r['owner']),time_part=f'{start:%H:%M} - {end:%H:%M}' if start and end else '',risk=r['risk'],grid_risk='' if r['grid'] == '无' else r['grid'],same_inout=same,need_leader_no=missing if not r['same'] else None))
+        records.append(dict(order=i,source_row=r['row'],seq=str(i),profession=mod.classify_profession(r['profession'],r['owner']),raw_profession=r['profession'],work=r['work'],unit=r['unit'],leader=mod.clean_person_name(r['owner']),time_part=f'{start:%H:%M} - {end:%H:%M}' if start and end else '',risk=r['risk'],grid_risk='' if r['grid'] == '无' else r['grid'],same_inout=same,need_leader_no=missing if (not r['same'] and r.get('needsSelection')) else None))
     mod.prepare_summary_source_entries(records)
     result = {'a':'\n'.join(mod.build_mode_a_summary_lines(doc['title'],records)), 'b':''}
     if mode_b:
@@ -563,8 +619,10 @@ class Session:
         return self.view()
 
     def view(self):
+        required = [r for r in self.documents.get('site',{}).get('records',[]) if r.get('needsSelection')]
         return {'documents':self.documents,'issues':audit(self.documents),'revision':self.revision,
-                'ready':bool(self.documents) and all(r['same'].strip() for r in self.documents['site']['records']),
+                'ready':bool(self.documents) and all(r['same'].strip() for r in required),
+                'selection':{'required':len(required),'completed':sum(bool(r['same'].strip()) for r in required)},
                 'changes':self.changes,
                 'outputLocation':str(self.source_paths['site'].parent/'（处理后）') if self.source_paths else '本机输出目录（兼容导入，可下载完整压缩包）'}
 
@@ -578,6 +636,8 @@ class Session:
             if len(value)>32767:
                 raise ValueError('单元格文字超过 Excel 上限')
             target = self.documents[kind] if field == 'title' else next(r for r in self.documents[kind]['records'] if r['row'] == row)
+            if field == 'same' and not target.get('needsSelection'):
+                raise ValueError('该单元格原本已有人员，或人员层级不是领导人员，不提供同进同出选择')
             before = target[field]
             if before != value:
                 target[field] = value
@@ -602,7 +662,7 @@ class Session:
                     sheet.Activate()
                     app.Calculate()
                     for r in self.documents['site']['records']:
-                        if not r['formula']:
+                        if not r.get('needsSelection') or r.get('same') or not r['formula']:
                             continue
                         try:
                             sheet.Cells(r['row'],self.documents['site']['fields']['same']).Activate()
@@ -649,8 +709,9 @@ class Session:
                     self.status['log'].append(message)
                     mod.REPORT_LINES.append(message)
                 mod.log = log; mod.log_red = log; mod.REPORT_LINES.clear()
-                if not self.documents or not all(r['same'].strip() for r in self.documents['site']['records']):
-                    raise ValueError('有效作业的同进同出人员必须全部填写')
+                required = [r for r in self.documents.get('site',{}).get('records',[]) if r.get('needsSelection')]
+                if not self.documents or not all(r['same'].strip() for r in required):
+                    raise ValueError('需要领导的作业必须全部填写同进同出人员')
                 current_issues = audit(self.documents)
                 if any(i['id'] not in options.get('acknowledged',[]) for i in current_issues):
                     raise ValueError('仍有未确认的告警，请先修正或选择保留告警继续')
@@ -705,11 +766,10 @@ class Session:
                             if text(sheet.cell(rr,1).value) and not text(sheet.cell(rr,work_col).value):
                                 final_warnings.append(f'{path.name} 第 {rr} 行有序号但缺工作内容，仍含其他数据或合并内容，未按空白行删除；请核对缺填内容。')
                         checked.close()
-                    # The final saved site workbook, not a stale Mode A preview, drives both summaries.
-                    summary,counter = mod.process_excel(str(paths['site']))
-                    mod.prepare_summary_source_entries(summary['records'])
-                    texts = {'a':'\n'.join(mod.build_mode_a_summary_lines(summary['title'],summary['records'])),
-                             'b':'\n'.join(mod.build_mode_b_summary_lines(summary['title'],summary['records'],counter))}
+                    # The final saved site workbook drives both summaries. The wrapper
+                    # applies the user's personnel-level rule before calling the exact
+                    # original Mode A/B builders.
+                    texts = summaries(final_docs['site'],True)
                     for path in [paths['site'],target,paths['risk'],target.with_suffix('.pdf'),paths['risk'].with_suffix('.pdf')]:
                         shutil.copy2(path,output/path.name)
                     (output/'汇总-模式A.txt').write_text(texts['a'],encoding='utf-8-sig')
@@ -771,7 +831,7 @@ def publish_output(source, destination):
             raise
 
 
-def serve(port=0, open_browser=True, base=None):
+def serve(port=0, open_browser=True, base=None, url_file=None):
     token = secrets.token_urlsafe(32)
     base = Path(base) if base else Path(os.environ.get('LOCALAPPDATA',tempfile.gettempdir()))/'DailyPlanWorkbench'
     base.mkdir(parents=True,exist_ok=True)
@@ -879,8 +939,13 @@ def serve(port=0, open_browser=True, base=None):
     server = ThreadingHTTPServer(('127.0.0.1',port),Handler)
     url = f'http://127.0.0.1:{server.server_port}/?token={token}'
     print('日计划工作台已启动：'+url,flush=True)
+    if url_file:
+        Path(url_file).write_text(url,encoding='utf-8')
     if open_browser:
-        webbrowser.open(url)
+        try:
+            os.startfile(url)
+        except Exception:
+            webbrowser.open(url)
     try:
         server.serve_forever()
     finally:
@@ -892,10 +957,11 @@ if __name__ == '__main__':
     parser.add_argument('--port',type=int,default=0)
     parser.add_argument('--no-browser',action='store_true')
     parser.add_argument('--base',type=Path)
+    parser.add_argument('--url-file',type=Path)
     args = parser.parse_args()
     try:
         import openpyxl, pandas, win32com.client
-        serve(args.port,not args.no_browser,args.base)
+        serve(args.port,not args.no_browser,args.base,args.url_file)
     except Exception:
         message = traceback.format_exc()
         (ROOT/'启动错误.txt').write_text(message,encoding='utf-8')

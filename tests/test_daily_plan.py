@@ -24,6 +24,8 @@ def sample(kind='site'):
         s.cell(rr,1,'例' if rr==3 else rr-3)
         fields={5:'更换设备'+str(rr),12:'2026-09-07 08:00',13:'2026-09-07 17:00',11:'测试负责人',3:'配电',9:'测试单位',18:'三级',19:'无',14:'到岗测试'} if kind=='site' else {6:'更换设备'+str(rr),2:'2026-09-07 08:00',3:'2026-09-07 17:00',7:'测试负责人',4:'三级',5:'无'}
         for col,v in fields.items():s.cell(rr,col,v)
+        if kind=='site' and rr==4:s.cell(rr,16,'附件4-31-领导人员')
+        if kind=='site' and rr==5:s.cell(rr,16,'附件5-32-管理人员')
         s.cell(rr,18 if kind=='site' else 4).fill=PatternFill('solid',fgColor='FFFF00')
     # A formatting-only continuation is not another job.
     s.cell(6,1).font=Font(size=45)
@@ -41,7 +43,18 @@ class DailyTests(unittest.TestCase):
         self.assertEqual(len(doc['records']),2)
         a,b=doc['records'];self.assertEqual(len(a['options']),2);self.assertEqual(len(b['options']),1)
         self.assertTrue(a['inherited']);self.assertFalse(b['inherited'])
+        self.assertTrue(a['needsSelection']);self.assertFalse(b['needsSelection'])
         self.assertEqual(doc['hiddenSheets'],['Sheet4'])
+
+    def test_only_blank_leader_rows_require_selection(self):
+        docs={k:d.read_document('9月7日'+k+'.xlsx',sample(k),k) for k in ('site','risk')}
+        sess=d.Session(tempfile.gettempdir());sess.documents=copy.deepcopy(docs)
+        view=sess.view();self.assertEqual(view['selection'],{'required':1,'completed':0});self.assertFalse(view['ready'])
+        self.assertFalse(any(i['code']=='DROPDOWN' and i['row']==5 for i in view['issues']))
+        with self.assertRaisesRegex(ValueError,'不提供同进同出选择'):
+            sess.update([dict(kind='site',row=5,field='same',value='不应写入')])
+        sess.update([dict(kind='site',row=4,field='same',value='测试甲')])
+        self.assertTrue(sess.view()['ready'])
 
     def test_patch_preserves_package_and_clones_only_missing_rule(self):
         data=sample();original=d.read_document('9月7日现场.xlsx',data,'site');doc=copy.deepcopy(original)
@@ -94,6 +107,16 @@ class DailyTests(unittest.TestCase):
         docs['site']['records'][0]['end']='2026-09-07 06:00';self.assertIn('TIME_ORDER',[i['code'] for i in d.audit(docs)])
         docs['site']['title']='某公司9月8日现场作业计划';self.assertIn('TITLE_DATE',[i['code'] for i in d.audit(docs)])
         docs['risk']['records'].pop();self.assertIn('COUNT',[i['code'] for i in d.audit(docs)])
+
+    def test_cleaned_composite_matching_ignores_order(self):
+        docs={k:d.read_document('9月7日'+k+'.xlsx',sample(k),k) for k in ('site','risk')}
+        docs['risk']['records'].reverse()
+        self.assertFalse(any(i['code'] in ('COUNT','UNMATCHED','CROSS_TIME') for i in d.audit(docs)))
+        docs['risk']['records'][0]['work']='措辞稍有不同'
+        codes=[i['code'] for i in d.audit(docs)]
+        self.assertIn('CROSS_WORK',codes);self.assertNotIn('UNMATCHED',codes)
+        self.assertEqual(docs['site']['cleanup']['exampleRowsRemoved'],[3])
+        self.assertIn(6,docs['site']['cleanup']['blankRowsRemoved'])
 
     def test_backup_not_overwritten_and_explicit_edit(self):
         with tempfile.TemporaryDirectory() as t:
